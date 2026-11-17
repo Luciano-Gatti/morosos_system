@@ -1,0 +1,50 @@
+/morosos-control-service/target/
+/morosos-service/target/
+/auth-service/target/
+
+# Dependencias y resultados de compilación
+**/node_modules/
+**/dist/
+**/dist-ssr/
+**/target/
+
+# Variables locales (las plantillas sin secretos sí se versionan)
+.env
+.env.*
+*.env
+*.env.*
+!*.env.example
+!*.env.*.example
+!.env.example
+!.env.*.example
+*.local
+
+# Claves privadas y almacenes de credenciales
+*.pem
+*.ppk
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa
+id_ed25519
+
+# Respaldos y volcados de datos
+/backup*.zip
+/revision-backup*.zip
+/backups/
+*.dump
+*.backup
+# Los SQL de src/main/resources/db/migration sí deben versionarse.
+
+# Logs, temporales y archivos de trabajo
+*.log
+/tmp/
+qa-*.html
+.DS_Store
+Thumbs.db
+.idea/
+
+# Documentación local: no se publica en el repositorio
+/docs/
