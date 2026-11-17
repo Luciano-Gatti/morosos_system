@@ -1,0 +1,12 @@
+app:
+  cors:
+    allowed-origins:
+      - ${FRONTEND_URL:http://localhost:5173}
+  jwt:
+    secret: ${JWT_SECRET}
+  seed:
+    admin:
+      enabled: ${AUTH_SEED_ADMIN_ENABLED:false}
+      username: ${AUTH_SEED_ADMIN_USERNAME:admin}
+      email: ${AUTH_SEED_ADMIN_EMAIL:lucianogatti01@gmail.com}
+      password: ${AUTH_SEED_ADMIN_PASSWORD:}

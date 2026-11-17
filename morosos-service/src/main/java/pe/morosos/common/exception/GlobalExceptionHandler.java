@@ -1,0 +1,143 @@
+package pe.morosos.common.exception;
+
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.validation.ConstraintViolationException;
+import java.time.Instant;
+import java.util.List;
+import java.util.UUID;
+import java.util.stream.Collectors;
+import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.security.core.AuthenticationException;
+import org.springframework.validation.FieldError;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+import pe.morosos.common.api.ErrorResponse;
+
+@Slf4j
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<ErrorResponse> handleMethodArgumentNotValid(MethodArgumentNotValidException ex,
+                                                                      HttpServletRequest request) {
+        List<ErrorResponse.Detail> details = ex.getBindingResult()
+                .getFieldErrors()
+                .stream()
+                .map(this::toFieldError)
+                .collect(Collectors.toList());
+        return build(HttpStatus.BAD_REQUEST, "REQUEST_INVALID", "Request inválido", details, request);
+    }
+
+    @ExceptionHandler(ConstraintViolationException.class)
+    public ResponseEntity<ErrorResponse> handleConstraintViolation(ConstraintViolationException ex,
+                                                                   HttpServletRequest request) {
+        List<ErrorResponse.Detail> details = ex.getConstraintViolations().stream()
+                .map(v -> new ErrorResponse.Detail(v.getPropertyPath().toString(), v.getMessage()))
+                .toList();
+        return build(HttpStatus.BAD_REQUEST, "REQUEST_INVALID", "Request inválido", details, request);
+    }
+
+    @ExceptionHandler(org.springframework.web.method.annotation.MethodArgumentTypeMismatchException.class)
+    public ResponseEntity<ErrorResponse> handleTypeMismatch(
+            org.springframework.web.method.annotation.MethodArgumentTypeMismatchException ex,
+            HttpServletRequest request) {
+        String message = "Valor inválido para el parámetro " + ex.getName() + ".";
+        Class<?> type = ex.getRequiredType();
+        if (type != null && type.isEnum()) {
+            message += " Opciones admitidas: " + java.util.Arrays.stream(type.getEnumConstants())
+                    .map(Object::toString).collect(Collectors.joining(", ")) + ".";
+        }
+        return build(HttpStatus.BAD_REQUEST, "REQUEST_INVALID", message,
+                List.of(new ErrorResponse.Detail(ex.getName(), message)), request);
+    }
+
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    public ResponseEntity<ErrorResponse> handleHttpMessageNotReadable(HttpMessageNotReadableException ex,
+                                                                      HttpServletRequest request) {
+        return build(HttpStatus.BAD_REQUEST, "REQUEST_INVALID", "Request inválido", null, request);
+    }
+
+    @ExceptionHandler(ValidationException.class)
+    public ResponseEntity<ErrorResponse> handleValidation(ValidationException ex, HttpServletRequest request) {
+        return build(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", ex.getMessage(), ex.getDetails(), request);
+    }
+
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity<ErrorResponse> handleNotFound(ResourceNotFoundException ex, HttpServletRequest request) {
+        return build(HttpStatus.NOT_FOUND, "RESOURCE_NOT_FOUND", ex.getMessage(), null, request);
+    }
+
+    @ExceptionHandler({BusinessRuleException.class, ConflictException.class})
+    public ResponseEntity<ErrorResponse> handleConflict(RuntimeException ex, HttpServletRequest request) {
+        return build(HttpStatus.CONFLICT, "BUSINESS_RULE_CONFLICT", ex.getMessage(), null, request);
+    }
+
+    @ExceptionHandler(AccessDeniedException.class)
+    public ResponseEntity<ErrorResponse> handleAccessDenied(AccessDeniedException ex, HttpServletRequest request) {
+        return build(HttpStatus.FORBIDDEN, "AUTH_FORBIDDEN", "No tiene permisos para realizar esta acción.", null, request);
+    }
+
+    @ExceptionHandler(AuthenticationException.class)
+    public ResponseEntity<ErrorResponse> handleAuthentication(AuthenticationException ex, HttpServletRequest request) {
+        return build(HttpStatus.UNAUTHORIZED, "AUTH_UNAUTHORIZED", "Debe autenticarse para realizar esta acción.", null, request);
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ErrorResponse> handleUnexpected(Exception ex, HttpServletRequest request) {
+        String traceId = resolveTraceId(request);
+        log.error("Error interno no controlado. traceId={}, method={}, path={}",
+                traceId,
+                request.getMethod(),
+                request.getRequestURI(),
+                ex);
+        ErrorResponse response = new ErrorResponse(
+                Instant.now(),
+                HttpStatus.INTERNAL_SERVER_ERROR.value(),
+                "INTERNAL_ERROR",
+                "Ocurrió un error interno.",
+                null,
+                traceId
+        );
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(response);
+    }
+
+    private ErrorResponse.Detail toFieldError(FieldError fieldError) {
+        return new ErrorResponse.Detail(fieldError.getField(), fieldError.getDefaultMessage());
+    }
+
+    private ResponseEntity<ErrorResponse> build(HttpStatus status,
+                                                String code,
+                                                String message,
+                                                List<ErrorResponse.Detail> details,
+                                                HttpServletRequest request) {
+        ErrorResponse response = new ErrorResponse(
+                Instant.now(),
+                status.value(),
+                code,
+                message,
+                details,
+                resolveTraceId(request)
+        );
+        return ResponseEntity.status(status).body(response);
+    }
+
+    private String resolveTraceId(HttpServletRequest request) {
+        String traceId = MDC.get("traceId");
+        if (traceId != null && !traceId.isBlank()) {
+            return traceId;
+        }
+
+        String requestTraceId = request.getHeader("X-Trace-Id");
+        if (requestTraceId != null && !requestTraceId.isBlank()) {
+            return requestTraceId;
+        }
+
+        return UUID.randomUUID().toString().substring(0, 8);
+    }
+}

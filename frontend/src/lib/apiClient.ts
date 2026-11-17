@@ -1,0 +1,159 @@
+import { clearStoredAuth, getStoredAccessToken, getStoredRefreshToken, persistSession } from "@/services/api/authStorage";
+import type { ApiErrorResponse, LoginResponse } from "@/types/auth";
+
+export class ApiError extends Error {
+  status: number;
+  data: unknown;
+
+  constructor(message: string, status: number, data?: unknown) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.data = data;
+    Object.setPrototypeOf(this, ApiError.prototype);
+  }
+}
+
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, "") ?? "http://localhost:8081/api/v1";
+const API_PREFIX = "/api/v1";
+const AUTH_BASE_URL = import.meta.env.VITE_AUTH_BASE_URL?.replace(/\/$/, "") ?? "http://localhost:8080";
+
+export const USE_API = import.meta.env.VITE_USE_API === "true";
+
+export type QueryValue = string | number | boolean | null | undefined;
+
+export function buildQueryParams(params?: Record<string, QueryValue>): string {
+  if (!params) return "";
+  const search = new URLSearchParams();
+  Object.entries(params).forEach(([k, v]) => {
+    if (v === undefined || v === null || v === "") return;
+    search.set(k, String(v));
+  });
+  const query = search.toString();
+  return query ? `?${query}` : "";
+}
+
+function redirectToLoginAfterUnauthorized() {
+  if (typeof window === "undefined") return;
+
+  if (window.location.pathname === "/login") return;
+
+  const currentPath = `${window.location.pathname}${window.location.search}`;
+  window.location.assign(`/login?from=${encodeURIComponent(currentPath)}`);
+}
+
+let refreshPromise: Promise<string | null> | null = null;
+
+async function parseJsonSafe(response: Response) {
+  const text = await response.text();
+  if (!text) return null;
+  try {
+    return JSON.parse(text) as ApiErrorResponse | LoginResponse;
+  } catch {
+    return null;
+  }
+}
+
+export async function refreshAccessToken(): Promise<string | null> {
+  const refreshToken = getStoredRefreshToken();
+  if (!refreshToken) return null;
+  if (!refreshPromise) {
+    refreshPromise = (async () => {
+      const response = await fetch(`${AUTH_BASE_URL}/api/v1/auth/refresh`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ refreshToken }),
+      });
+      const payload = await parseJsonSafe(response);
+      if (getStoredRefreshToken() !== refreshToken) return null;
+      if (!response.ok || !payload || !("accessToken" in payload)) {
+        clearStoredAuth();
+        return null;
+      }
+      persistSession(payload.accessToken, payload.refreshToken, payload.user);
+      return payload.accessToken;
+    })().finally(() => {
+      refreshPromise = null;
+    });
+  }
+  return refreshPromise;
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const normalizedPath = API_BASE_URL.endsWith(API_PREFIX) && path.startsWith(API_PREFIX)
+    ? path.slice(API_PREFIX.length) || "/"
+    : path;
+  const url = `${API_BASE_URL}${normalizedPath}`;
+  const token = getStoredAccessToken();
+  const headers = new Headers(init?.headers);
+
+  if (!(init?.body instanceof FormData) && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+  headers.set("Accept", "application/json");
+
+  if (token) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+
+  let response = await fetch(url, {
+    ...init,
+    headers,
+  });
+
+  if (response.status === 401) {
+    const refreshedAccessToken = await refreshAccessToken();
+    if (refreshedAccessToken) {
+      headers.set("Authorization", `Bearer ${refreshedAccessToken}`);
+      response = await fetch(url, {
+        ...init,
+        headers,
+      });
+    }
+  }
+
+  const contentType = response.headers.get("content-type") || "";
+  const isJson = contentType.includes("application/json");
+  const rawResponseText = await response.text();
+
+  let payload: unknown = rawResponseText;
+  if (isJson && rawResponseText) {
+    try {
+      payload = JSON.parse(rawResponseText);
+    } catch {
+      if (import.meta.env.DEV) {
+        console.warn("[apiClient] No se pudo parsear una respuesta JSON.", { status: response.status });
+      }
+    }
+  }
+
+  if (!response.ok) {
+    if (response.status === 401) {
+      clearStoredAuth();
+      redirectToLoginAfterUnauthorized();
+    }
+
+    if (response.status === 403) {
+      throw new ApiError("No tenés permisos para realizar esta acción.", response.status);
+    }
+
+    const message =
+      (typeof payload === "object" && payload && "message" in payload && String(payload.message)) ||
+      (typeof payload === "string" && payload.trim()) ||
+      `${response.status} ${response.statusText}`.trim();
+    throw new ApiError(`${response.status} ${message}`.trim(), response.status);
+  }
+
+  return payload as T;
+}
+
+export const apiClient = {
+  get: <T = unknown>(path: string) => request<T>(path),
+  post: <T = unknown>(path: string, body?: unknown) =>
+    request<T>(path, { method: "POST", body: body instanceof FormData ? body : JSON.stringify(body ?? {}) }),
+  put: <T = unknown>(path: string, body?: unknown) =>
+    request<T>(path, { method: "PUT", body: JSON.stringify(body ?? {}) }),
+  patch: <T = unknown>(path: string, body?: unknown) =>
+    request<T>(path, { method: "PATCH", body: JSON.stringify(body ?? {}) }),
+  delete: <T = unknown>(path: string) => request<T>(path, { method: "DELETE" }),
+};

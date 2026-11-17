@@ -1,0 +1,2115 @@
+import { useEffect, useMemo, useState } from "react";
+import { useAuth } from "@/hooks/useAuth";
+import { PERMISSIONS } from "@/auth/permissions";
+import { Link, useNavigate, useParams } from "react-router-dom";
+import { AppHeader } from "@/components/layout/AppHeader";
+import { Button } from "@/components/ui/button";
+import { Calendar } from "@/components/ui/calendar";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { useToast } from "@/hooks/use-toast";
+import { cn } from "@/lib/utils";
+import { format } from "date-fns";
+import { es } from "date-fns/locale";
+import {
+  CalendarIcon,
+  FileDown,
+  FileSpreadsheet,
+  Building2,
+  HandCoins,
+  ListChecks,
+  CalendarRange,
+  Filter,
+  History,
+} from "lucide-react";
+import {
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  Tooltip,
+  ResponsiveContainer,
+  CartesianGrid,
+  Cell,
+  PieChart,
+  Pie,
+  Legend,
+  LineChart,
+  Line,
+} from "recharts";
+import { conteoPorTipo, serieDiaria, TIPOS_REGULARIZACION } from "@/lib/reportesUtils";
+import type { ExportPdfOptions, ExportXlsxOptions } from "@/lib/exportReporte";
+import type {
+  AccionRegistro,
+  AccionTipo,
+  AccionesRegularizacionViewModel,
+  InmuebleEstadoRow,
+  MorosidadPorcentajeTotal,
+  MorososPorDistritoRow,
+  MorososPorGrupoRow,
+  MovimientoRegistro,
+  MovimientoTipo,
+} from "@/types/reportes";
+import { reportesApi } from "@/services/api/reportesApi";
+import { mapReporteAccionesFechas, mapReporteAccionesRegularizacionDetallado, mapReporteEstadoInmuebles, mapReporteHistorialMovimientos, mapReporteMorosos } from "@/adapters/reportes";
+import { USE_API } from "@/lib/apiClient";
+
+async function exportarReportePdf(options: ExportPdfOptions) {
+  const exporter = await import("@/lib/exportReporte");
+  return exporter.exportarReportePdf(options);
+}
+
+async function exportarReporteXlsx(options: ExportXlsxOptions) {
+  const exporter = await import("@/lib/exportReporte");
+  return exporter.exportarReporteXlsx(options);
+}
+
+/* ---------- Helpers ---------- */
+
+const numberFmt = new Intl.NumberFormat("es-AR");
+const moneyFmt = new Intl.NumberFormat("es-AR", {
+  style: "currency",
+  currency: "ARS",
+  maximumFractionDigits: 0,
+});
+const pctFmt = (n: number) => `${n.toFixed(1)}%`;
+const dateFmt = new Intl.DateTimeFormat("es-AR", {
+  day: "2-digit",
+  month: "2-digit",
+  year: "numeric",
+});
+
+const ORGANISMO = "AOSC — Administración de Obras Sanitarias";
+
+type ReporteId =
+  | "morosos-grupo-distrito"
+  | "estado-inmuebles"
+  | "acciones-fechas"
+  | "acciones-regularizacion"
+  | "historial-movimientos";
+
+type ReporteSource = "api";
+type ReporteDataState<T> = { data: T; loading: boolean; error: string | null; empty: boolean; source: ReporteSource };
+type UnknownRecord = Record<string, unknown>;
+
+const emptyMorososViewModel = () => ({
+  grupos: [],
+  distritos: [],
+  total: { totalInmuebles: 0, deudores: 0, morosos: 0, alDia: 0, porcentajeMorosidad: 0 },
+  parametroCuotasMoroso: 0,
+});
+const emptyRowsViewModel = <T,>() => ({ rows: [] as T[] });
+
+function getReporteMorososViewModel() {
+  return emptyMorososViewModel();
+}
+function getReporteEstadoInmueblesViewModel() {
+  return { rows: [], totales: { totalInmuebles: 0, alDia: 0, deudores: 0, morosos: 0, deudaTotal: 0 }, distribucion: [], parametroCuotasMoroso: 0 };
+}
+function getReporteHistorialMovimientosViewModel() {
+  return emptyRowsViewModel<MovimientoRegistro>();
+}
+function getReporteAccionesFechasViewModel(_desde: Date | null, _hasta: Date | null) {
+  return emptyRowsViewModel<AccionRegistro>();
+}
+function getReporteAccionesRegularizacionViewModel(_desde: Date | null, _hasta: Date | null) {
+  return { rows: [] as AccionRegistro[], detallePorTipo: [], planesDePago: [], compromisosDePago: [] } as AccionesRegularizacionViewModel;
+}
+
+interface PlanPagoDetalle {
+  fechaAlta: Date;
+  cuenta: string;
+  titular: string;
+  grupo: string;
+  cuotas: number;
+  montoTotal: number;
+  proximoVencimiento: Date | null;
+  vencimientoFinal: Date | null;
+  estado: string;
+}
+
+interface ReporteExportData {
+  grupos?: MorososPorGrupoRow[];
+  distritos?: MorososPorDistritoRow[];
+  total?: MorosidadPorcentajeTotal;
+  rows?: unknown[];
+  detallePorTipo?: AccionesRegularizacionViewModel["detallePorTipo"];
+  planesDePago?: AccionesRegularizacionViewModel["planesDePago"];
+}
+const fmtDateSafe = (d: Date | null | undefined) => (d ? dateFmt.format(d) : "—");
+const fmtTextSafe = (value: string | null | undefined) => value && value.trim() ? value : "—";
+const fmtMoneySafe = (value: number | null | undefined) => Number.isFinite(value) ? moneyFmt.format(value as number) : "—";
+const sortMorososGrupoDistrito = <T extends { distrito: string; grupo: string }>(rows: T[]) =>
+  [...rows].sort((a, b) => {
+    const distritoCmp = a.distrito.localeCompare(b.distrito, "es", { sensitivity: "base" });
+    if (distritoCmp !== 0) return distritoCmp;
+    return a.grupo.localeCompare(b.grupo, "es", { sensitivity: "base" });
+  });
+
+
+interface TipoAccionFiltro {
+  key: string;
+  label: string;
+  codigo?: string;
+}
+
+const normalizarTipoKey = (value: string) =>
+  value
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+
+const crearTipoAccionFiltros = (rows: AccionRegistro[]): TipoAccionFiltro[] => {
+  const byKey = new Map<string, TipoAccionFiltro>();
+
+  rows.forEach((row) => {
+    const label = (row.tipo ?? "").trim();
+    if (!label) return;
+
+    const codigo = typeof row.codigo === "string" && row.codigo.trim()
+      ? row.codigo.trim()
+      : undefined;
+    const key = normalizarTipoKey(codigo ?? label);
+    if (!key) return;
+
+    if (!byKey.has(key)) {
+      byKey.set(key, { key, label, codigo });
+    }
+  });
+
+  return Array.from(byKey.values());
+};
+
+interface ReporteDef {
+  id: ReporteId;
+  titulo: string;
+  descripcion: string;
+  icono: React.ComponentType<{ className?: string }>;
+  conFechas: boolean;
+}
+
+const REPORTES: ReporteDef[] = [
+  {
+    id: "morosos-grupo-distrito",
+    titulo: "Morosos por grupo y distrito",
+    descripcion: "Distribución actual de inmuebles morosos.",
+    icono: Building2,
+    conFechas: false,
+  },
+  {
+    id: "estado-inmuebles",
+    titulo: "Estado actual de inmuebles",
+    descripcion: "Listado completo del padrón con su estado.",
+    icono: ListChecks,
+    conFechas: false,
+  },
+  {
+    id: "acciones-fechas",
+    titulo: "Acciones entre fechas",
+    descripcion:
+      "Avisos, intimaciones, cortes y demás acciones del período, con evolución diaria y detalle.",
+    icono: CalendarRange,
+    conFechas: true,
+  },
+  {
+    id: "acciones-regularizacion",
+    titulo: "Acciones de regularización",
+    descripcion: "Regularizaciones, planes y compromisos de pago del período.",
+    icono: HandCoins,
+    conFechas: true,
+  },
+  {
+    id: "historial-movimientos",
+    titulo: "Historial de movimientos",
+    descripcion: "Acciones registradas en el sistema con filtros y detalle.",
+    icono: History,
+    conFechas: false,
+  },
+];
+
+/* ---------- Presets de fecha ---------- */
+
+type PresetId = "hoy" | "7dias" | "mes" | "anio" | "custom";
+
+
+function hasRealDataForExport(reporte: ReporteDef, reporteState: ReporteDataState<unknown>): boolean {
+  const data = asRecord(reporteState.data);
+  if (reporte.id === "morosos-grupo-distrito") {
+    const grupos = data.grupos;
+    const distritos = data.distritos;
+    return Array.isArray(grupos) && Array.isArray(distritos) && (grupos.length > 0 || distritos.length > 0);
+  }
+  const rows = data.rows;
+  return Array.isArray(rows) && rows.length > 0;
+}
+
+function asRecord(value: unknown): UnknownRecord {
+  return typeof value === "object" && value !== null ? value as UnknownRecord : {};
+}
+
+function errorMessage(error: unknown, fallback: string) {
+  return error instanceof Error && error.message ? error.message : fallback;
+}
+
+function presetRange(p: PresetId): { desde: Date | null; hasta: Date | null } {
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  if (p === "hoy") return { desde: now, hasta: now };
+  if (p === "7dias") {
+    const d = new Date(now);
+    d.setDate(d.getDate() - 6);
+    return { desde: d, hasta: now };
+  }
+  if (p === "mes") {
+    const d = new Date(now.getFullYear(), now.getMonth(), 1);
+    return { desde: d, hasta: now };
+  }
+  if (p === "anio") {
+    const d = new Date(now.getFullYear(), 0, 1);
+    return { desde: d, hasta: now };
+  }
+  return { desde: null, hasta: null };
+}
+
+/* ============================================================
+   Página principal — Reportes
+   ============================================================ */
+
+export default function Reportes() {
+  const { reporteId } = useParams<{ reporteId?: string }>();
+  const navigate = useNavigate();
+  const { hasPermission } = useAuth();
+  const reporteActivo =
+    REPORTES.find((r) => r.id === reporteId) ?? REPORTES[0];
+
+  const breadcrumb = reporteId
+    ? [{ label: "Reportes", to: "/reportes" }, { label: reporteActivo.titulo }]
+    : [{ label: "Reportes" }];
+
+  return (
+    <>
+      <AppHeader
+        title="Reportes"
+        description="Reportes operativos del sistema. Visualizá indicadores en pantalla y exportá a PDF o Excel."
+        breadcrumb={breadcrumb}
+      />
+
+      <main className="flex-1 px-4 py-4 sm:px-6 sm:py-6">
+        {!reporteId && hasPermission(PERMISSIONS.REPORTES_VER_FACTURACION_RECAUDACION) && (
+          <Link to="/reportes/facturacion-recaudacion" className="mb-4 block rounded-md border border-primary/30 bg-surface p-4 hover:bg-primary-soft">
+            <h2 className="font-semibold">Facturación y recaudación</h2>
+            <p className="mt-1 text-sm text-muted-foreground">Evolución mensual de emisiones y pagos, cuentas únicas y desglose por grupo y planes.</p>
+          </Link>
+        )}
+        {!reporteId ? (
+          <ReportesCatalogo onSelect={(id) => navigate(`/reportes/${id}`)} />
+        ) : (
+          <div className="rounded-md border border-border bg-surface shadow-sm">
+            <ReportePanel key={reporteActivo.id} reporte={reporteActivo} />
+          </div>
+        )}
+      </main>
+    </>
+  );
+}
+
+/* ============================================================
+   Catálogo (vista al entrar sin reporte seleccionado)
+   ============================================================ */
+
+function ReportesCatalogo({ onSelect }: { onSelect: (id: ReporteId) => void }) {
+  return (
+    <div className="rounded-md border border-border bg-surface shadow-sm">
+      <div className="border-b border-border px-4 py-3">
+        <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+          Catálogo
+        </div>
+        <h2 className="mt-0.5 font-serif text-[19px] font-semibold leading-tight text-foreground">
+          Reportes disponibles
+        </h2>
+        <p className="mt-0.5 text-[12.5px] text-muted-foreground">
+          Seleccioná un reporte del menú lateral o desde las tarjetas siguientes.
+        </p>
+      </div>
+      <ul className="grid grid-cols-1 gap-2 p-4 sm:grid-cols-2 xl:grid-cols-3">
+        {REPORTES.map((r) => {
+          const Icon = r.icono;
+          return (
+            <li key={r.id}>
+              <button
+                type="button"
+                onClick={() => onSelect(r.id)}
+                className="group flex w-full items-start gap-3 rounded-md border border-border bg-surface px-3 py-3 text-left transition-colors hover:border-primary/30 hover:bg-primary-soft"
+              >
+                <span className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-border bg-surface-muted text-muted-foreground group-hover:border-primary/30 group-hover:bg-primary group-hover:text-primary-foreground">
+                  <Icon className="h-4 w-4" />
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block text-[13.5px] font-medium leading-tight text-foreground">
+                    {r.titulo}
+                  </span>
+                  <span className="mt-1 block text-[12px] leading-snug text-muted-foreground">
+                    {r.descripcion}
+                  </span>
+                </span>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
+/* ============================================================
+   Panel del reporte activo
+   ============================================================ */
+
+function ReportePanel({ reporte }: { reporte: ReporteDef }) {
+  const { toast } = useToast();
+  const [distritoId, setDistritoId] = useState<string>("");
+  const [distritosCatalogo, setDistritosCatalogo] = useState<Array<{ id: string; nombre: string }>>([]);
+  const [distritosLoading, setDistritosLoading] = useState(false);
+  const [distritosError, setDistritosError] = useState<string | null>(null);
+  const [preset, setPreset] = useState<PresetId>("mes");
+  const [{ desde, hasta }, setRango] = useState(() => presetRange("mes"));
+  const [exportando, setExportando] = useState(false);
+  const [morososState, setMorososState] = useState<ReporteDataState<ReturnType<typeof getReporteMorososViewModel>>>({
+    data: getReporteMorososViewModel(),
+    loading: false,
+    error: null,
+    empty: false,
+    source: "api",
+  });
+  const [accionesFechasState, setAccionesFechasState] = useState<ReporteDataState<ReturnType<typeof getReporteAccionesFechasViewModel>>>({
+    data: getReporteAccionesFechasViewModel(desde, hasta),
+    loading: false,
+    error: null,
+    empty: false,
+    source: "api",
+  });
+  const [accionesRegularizacionState, setAccionesRegularizacionState] = useState<ReporteDataState<ReturnType<typeof getReporteAccionesRegularizacionViewModel>>>({
+    data: getReporteAccionesRegularizacionViewModel(desde, hasta),
+    loading: false,
+    error: null,
+    empty: false,
+    source: "api",
+  });
+  const [estadoInmueblesState, setEstadoInmueblesState] = useState<ReporteDataState<ReturnType<typeof getReporteEstadoInmueblesViewModel>>>({
+    data: getReporteEstadoInmueblesViewModel(),
+    loading: false,
+    error: null,
+    empty: false,
+    source: "api",
+  });
+  const [historialState, setHistorialState] = useState<ReporteDataState<ReturnType<typeof getReporteHistorialMovimientosViewModel>>>({
+    data: getReporteHistorialMovimientosViewModel(),
+    loading: false,
+    error: null,
+    empty: false,
+    source: "api",
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+    setDistritosLoading(true);
+    setDistritosError(null);
+    reportesApi.distritos(reporte.id)
+      .then(catalogo => {
+        if (!cancelled) setDistritosCatalogo(catalogo);
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setDistritosCatalogo([]);
+        setDistritosError(errorMessage(error, "No se pudo cargar distritos"));
+      })
+      .finally(() => {
+        if (!cancelled) setDistritosLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [reporte.id]);
+
+  useEffect(() => {
+    if (reporte.id !== "morosos-grupo-distrito") return;
+    let cancelled = false;
+    setMorososState((s) => ({ ...s, loading: true, error: null }));
+    reportesApi
+      .morososGrupoDistrito(distritoId ? { distritoId } : undefined)
+      .then((payload) => {
+        if (cancelled) return;
+        const vm = mapReporteMorosos(payload);
+        const gruposOrdenados = sortMorososGrupoDistrito(vm.grupos);
+        setMorososState({
+          data: { ...vm, grupos: gruposOrdenados },
+          loading: false,
+          error: null,
+          empty: gruposOrdenados.length === 0 && vm.distritos.length === 0,
+          source: "api",
+        });
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setMorososState((s) => ({
+          ...s,
+          loading: false,
+          error: errorMessage(error, "No se pudo cargar el reporte."),
+          source: "api",
+          data: emptyMorososViewModel(),
+          empty: true,
+        }));
+        toast({ title: "Error al cargar reporte", description: "No fue posible obtener morosos por grupo y distrito.", variant: "destructive" });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [reporte.id, distritoId, toast]);
+
+  useEffect(() => {
+    if (reporte.id !== "acciones-fechas") return;
+        let cancelled = false;
+    setAccionesFechasState((s) => ({ ...s, loading: true, error: null }));
+    reportesApi
+      .accionesFechas({
+        fechaDesde: desde ? format(desde, "yyyy-MM-dd") : undefined,
+        fechaHasta: hasta ? format(hasta, "yyyy-MM-dd") : undefined,
+        distritoId: distritoId || undefined,
+      })
+      .then((payload) => {
+        if (cancelled) return;
+        const vm = { rows: mapReporteAccionesFechas(payload) };
+        setAccionesFechasState({ data: vm, loading: false, error: null, empty: vm.rows.length === 0, source: "api" });
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setAccionesFechasState((s) => ({ ...s, loading: false, error: errorMessage(error, "No se pudo cargar el reporte."), source: "api", data: emptyRowsViewModel<AccionRegistro>(), empty: true }));
+        toast({ title: "Error al cargar reporte", description: "No fue posible obtener acciones entre fechas.", variant: "destructive" });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [reporte.id, desde, hasta, distritoId, toast]);
+
+  useEffect(() => {
+    if (reporte.id !== "estado-inmuebles") return;
+        let cancelled = false;
+    setEstadoInmueblesState((s) => ({ ...s, loading: true, error: null }));
+    reportesApi
+      .estadoInmuebles(distritoId ? { distritoId } : undefined)
+      .then((payload) => {
+        if (cancelled) return;
+        const vm = mapReporteEstadoInmuebles(payload);
+        setEstadoInmueblesState({ data: vm, loading: false, error: null, empty: vm.rows.length === 0, source: "api" });
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setEstadoInmueblesState((s) => ({ ...s, loading: false, error: errorMessage(error, "No se pudo cargar el reporte."), source: "api", data: getReporteEstadoInmueblesViewModel(), empty: true }));
+        toast({ title: "Error al cargar reporte", description: "No fue posible obtener estado de inmuebles.", variant: "destructive" });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [reporte.id, distritoId, toast]);
+
+  useEffect(() => {
+    if (reporte.id !== "historial-movimientos") return;
+        let cancelled = false;
+    setHistorialState((s) => ({ ...s, loading: true, error: null }));
+    reportesApi
+      .historialMovimientos({ distritoId: distritoId || undefined })
+      .then((payload) => {
+        if (cancelled) return;
+        const vm = { rows: mapReporteHistorialMovimientos(payload) };
+        setHistorialState({ data: vm, loading: false, error: null, empty: vm.rows.length === 0, source: "api" });
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setHistorialState((s) => ({ ...s, loading: false, error: errorMessage(error, "No se pudo cargar el reporte."), source: "api", data: getReporteHistorialMovimientosViewModel(), empty: true }));
+        toast({ title: "Error al cargar reporte", description: "No fue posible obtener historial de movimientos.", variant: "destructive" });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [reporte.id, distritoId, toast]);
+
+  useEffect(() => {
+    if (reporte.id !== "acciones-regularizacion") return;
+        let cancelled = false;
+    setAccionesRegularizacionState((s) => ({ ...s, loading: true, error: null }));
+    reportesApi
+      .accionesRegularizacion({
+        distritoId: distritoId || undefined,
+        fechaDesde: desde ? format(desde, "yyyy-MM-dd") : undefined,
+        fechaHasta: hasta ? format(hasta, "yyyy-MM-dd") : undefined,
+      })
+      .then((payload) => {
+        if (cancelled) return;
+        const vm = mapReporteAccionesRegularizacionDetallado(payload);
+        setAccionesRegularizacionState({ data: vm, loading: false, error: null, empty: vm.rows.length === 0, source: "api" });
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setAccionesRegularizacionState((s) => ({ ...s, loading: false, error: errorMessage(error, "No se pudo cargar el reporte."), source: "api", data: getReporteAccionesRegularizacionViewModel(desde, hasta), empty: true }));
+        toast({ title: "Error al cargar reporte", description: "No fue posible obtener regularizaciones.", variant: "destructive" });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [reporte.id, desde, hasta, distritoId, toast]);
+
+  const reporteState = useMemo(() => {
+    if (reporte.id === "morosos-grupo-distrito") {
+      return morososState;
+    }
+    if (reporte.id === "estado-inmuebles") {
+      return estadoInmueblesState;
+    }
+    if (reporte.id === "historial-movimientos") {
+      return historialState;
+    }
+    if (reporte.id === "acciones-fechas") {
+      return accionesFechasState;
+    }
+    if (reporte.id === "acciones-regularizacion") {
+      return accionesRegularizacionState;
+    }
+    return { data: null, loading: false, error: null, empty: false, source: "api" as ReporteSource };
+  }, [reporte.id, morososState, accionesFechasState, accionesRegularizacionState, estadoInmueblesState, historialState]);
+
+  const setPresetSafe = (p: PresetId) => {
+    setPreset(p);
+    if (p !== "custom") setRango(presetRange(p));
+  };
+
+  const reportesConFiltroDistrito = useMemo(
+    () => new Set<ReporteId>(["morosos-grupo-distrito", "estado-inmuebles", "acciones-fechas", "acciones-regularizacion", "historial-movimientos"]),
+    [],
+  );
+  const showDistritoFilter = reportesConFiltroDistrito.has(reporte.id);
+
+  const filtrosLabel = useMemo(() => {
+    const labels: string[] = [];
+    if (showDistritoFilter) {
+      const distritoLabel = distritoId
+        ? (distritosCatalogo.find((d) => d.id === distritoId)?.nombre ?? "Distrito seleccionado")
+        : "Todos los distritos";
+      labels.push(`Distrito: ${distritoLabel}`);
+    }
+    if (!reporte.conFechas) return labels;
+    const desdeS = desde ? dateFmt.format(desde) : "Inicio";
+    const hastaS = hasta ? dateFmt.format(hasta) : "Hoy";
+    labels.push(`Período: ${desdeS} — ${hastaS}`);
+    return labels;
+  }, [showDistritoFilter, reporte.conFechas, desde, hasta, distritoId, distritosCatalogo]);
+
+
+  const canExport = useMemo(() => {
+    if (reporteState.loading) return false;
+        return (
+      reporteState.source === "api"
+      && !reporteState.error
+      && !reporteState.empty
+      && hasRealDataForExport(reporte, reporteState)
+    );
+  }, [reporte, reporteState]);
+
+  const Header = (
+    <div className="border-b border-border px-4 py-3">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+            Reporte
+          </div>
+          <h2 className="mt-0.5 font-serif text-[19px] font-semibold leading-tight text-foreground">
+            {reporte.titulo}
+          </h2>
+          <p className="mt-0.5 text-[12.5px] text-muted-foreground">{reporte.descripcion}</p>
+        </div>
+        <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
+          {showDistritoFilter && (
+            <Select value={distritoId || "all"} onValueChange={(v) => setDistritoId(v === "all" ? "" : v)}>
+              <SelectTrigger className="h-8 w-full text-[12.5px] sm:w-[220px]" disabled={distritosLoading}>
+                <SelectValue placeholder="Distrito" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">Todos los distritos</SelectItem>
+                {distritosCatalogo.map((d) => (
+                  <SelectItem key={d.id} value={d.id}>{d.nombre}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+          <span className="text-[11.5px] text-muted-foreground">Exportar:</span>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-8 gap-1.5 text-[12.5px]"
+            disabled={exportando || !canExport}
+            onClick={() => handleExport("xlsx")}
+          >
+            <FileSpreadsheet className="h-3.5 w-3.5" />
+            Excel (.xlsx)
+          </Button>
+          <Button
+            size="sm"
+            className="h-8 gap-1.5 text-[12.5px]"
+            disabled={exportando || !canExport}
+            onClick={() => handleExport("pdf")}
+          >
+            <FileDown className="h-3.5 w-3.5" />
+            PDF
+          </Button>
+          {showDistritoFilter && distritosError && (
+            <span className="text-[12px] text-destructive">No se pudo cargar catálogo de distritos.</span>
+          )}
+        </div>
+      </div>
+
+      {reporte.conFechas && (
+        <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border pt-3">
+          <div className="flex items-center gap-1.5 pr-1 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+            <Filter className="h-3.5 w-3.5" />
+            Período
+          </div>
+
+          <div className="flex items-center gap-1 rounded-md border border-border bg-surface-muted/40 p-0.5">
+            {(
+              [
+                { id: "hoy", label: "Hoy" },
+                { id: "7dias", label: "Últimos 7 días" },
+                { id: "mes", label: "Mes actual" },
+                { id: "anio", label: "Año actual" },
+                { id: "custom", label: "Personalizado" },
+              ] as { id: PresetId; label: string }[]
+            ).map((p) => (
+              <button
+                key={p.id}
+                type="button"
+                onClick={() => setPresetSafe(p.id)}
+                className={cn(
+                  "rounded-[4px] px-2 py-1 text-[12px] font-medium transition-colors",
+                  preset === p.id
+                    ? "bg-surface text-foreground shadow-sm"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
+
+          <DateInput
+            label="Desde"
+            date={desde}
+            onChange={(d) => {
+              setPreset("custom");
+              setRango((r) => ({ ...r, desde: d }));
+            }}
+          />
+          <DateInput
+            label="Hasta"
+            date={hasta}
+            onChange={(d) => {
+              setPreset("custom");
+              setRango((r) => ({ ...r, hasta: d }));
+            }}
+          />
+        </div>
+      )}
+    </div>
+  );
+
+  const handleExport = async (kind: "pdf" | "xlsx") => {
+    if (USE_API && !canExport) {
+      toast({
+        title: "Exportación no disponible",
+        description: "No hay datos reales disponibles para exportar.",
+        variant: "destructive",
+      });
+      return;
+    }
+    setExportando(true);
+    try {
+      await runExport(kind, reporte, { desde, hasta }, filtrosLabel, reporteState);
+      toast({
+        title: kind === "pdf" ? "PDF generado" : "Excel generado",
+        description: `Reporte “${reporte.titulo}” exportado correctamente.`,
+      });
+    } catch (e) {
+      toast({
+        title: "Error al exportar",
+        description: "No fue posible generar el archivo.",
+        variant: "destructive",
+      });
+    } finally {
+      setExportando(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col">
+      {Header}
+      <div className="px-4 py-4">
+        {reporte.id === "morosos-grupo-distrito" && <ReporteMorososGrupoDistrito state={reporteState as ReporteDataState<ReturnType<typeof getReporteMorososViewModel>>} />}
+        {reporte.id === "acciones-regularizacion" && (
+          <ReporteAcciones
+            state={reporteState as ReporteDataState<AccionesRegularizacionViewModel>}
+            tipos={TIPOS_REGULARIZACION}
+            variante="regularizacion"
+            desde={desde}
+            hasta={hasta}
+          />
+        )}
+        {reporte.id === "estado-inmuebles" && <ReporteEstadoInmuebles state={reporteState as ReporteDataState<ReturnType<typeof getReporteEstadoInmueblesViewModel>>} />}
+        {reporte.id === "acciones-fechas" && <ReporteAccionesFechas state={reporteState as ReporteDataState<ReturnType<typeof getReporteAccionesFechasViewModel>>} />}
+        {reporte.id === "historial-movimientos" && <ReporteHistorialMovimientos state={reporteState as ReporteDataState<ReturnType<typeof getReporteHistorialMovimientosViewModel>>} />}
+      </div>
+    </div>
+  );
+}
+
+function DateInput({
+  label,
+  date,
+  onChange,
+}: {
+  label: string;
+  date: Date | null;
+  onChange: (d: Date | null) => void;
+}) {
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <Button variant="outline" size="sm" className="h-8 gap-1.5 text-[12.5px] tabular">
+          <CalendarIcon className="h-3.5 w-3.5 opacity-70" />
+          <span className="text-muted-foreground">{label}:</span>
+          {date ? format(date, "dd/MM/yyyy", { locale: es }) : "—"}
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent className="w-auto p-0" align="start">
+        <Calendar
+          mode="single"
+          selected={date ?? undefined}
+          onSelect={(d) => onChange(d ?? null)}
+          initialFocus
+          locale={es}
+          className={cn("p-3 pointer-events-auto")}
+        />
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+/* ============================================================
+   Bloques visuales reutilizables
+   ============================================================ */
+
+function KpiBar({ items }: { items: { label: string; value: string; tone?: "default" | "primary" | "danger" | "ok" }[] }) {
+  return (
+    <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+      {items.map((k) => (
+        <div
+          key={k.label}
+          className="rounded-md border border-border bg-surface-muted/40 px-3 py-2.5"
+        >
+          <div className="text-[10.5px] font-semibold uppercase tracking-wider text-muted-foreground">
+            {k.label}
+          </div>
+          <div
+            className={cn(
+              "mt-0.5 font-serif text-[20px] font-semibold leading-tight tabular",
+              k.tone === "danger" && "text-destructive",
+              k.tone === "ok" && "text-[hsl(var(--status-closed))]",
+              k.tone === "primary" && "text-primary",
+              !k.tone && "text-foreground",
+            )}
+          >
+            {k.value}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function SectionTitle({ children }: { children: React.ReactNode }) {
+  return (
+    <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+      {children}
+    </h3>
+  );
+}
+
+function ChartBox({
+  id,
+  title,
+  children,
+  height = 240,
+}: {
+  id: string;
+  title: string;
+  children: React.ReactNode;
+  height?: number;
+}) {
+  return (
+    <div className="rounded-md border border-border bg-surface p-3">
+      <SectionTitle>{title}</SectionTitle>
+      <div id={id} style={{ width: "100%", height }}>
+        <ResponsiveContainer width="100%" height="100%">
+          {children as React.ReactElement}
+        </ResponsiveContainer>
+      </div>
+    </div>
+  );
+}
+
+const COLORS_BAR = ["#1c355c", "#2c5282", "#3b6db1", "#5b8bd1", "#82a9e0", "#a8c2eb"];
+const COLORS_TIPO: Record<string, string> = {
+  "Aviso de deuda": "#3b6db1",
+  "Intimación": "#d97706",
+  "Aviso de corte": "#ea580c",
+  "Corte": "#b91c1c",
+  "Regularización": "#15803d",
+  "Plan de pago": "#0d9488",
+  "Compromiso de pago": "#7c3aed",
+};
+
+/* ============================================================
+   Reporte 1 — Morosos por grupo y distrito
+   ============================================================ */
+
+function ReporteMorososGrupoDistrito({
+  state,
+}: {
+  state: ReporteDataState<ReturnType<typeof getReporteMorososViewModel>>;
+}) {
+  if (state.loading) {
+    return <div className="rounded-md border border-border bg-surface-muted/30 px-4 py-8 text-center text-[12.5px] text-muted-foreground">Cargando reporte…</div>;
+  }
+  if (state.error) {
+    return <div className="rounded-md border border-destructive/30 bg-destructive/10 px-4 py-8 text-center text-[12.5px] text-destructive">{state.error}</div>;
+  }
+  const { grupos, distritos, total, parametroCuotasMoroso } = state.data;
+  if (state.empty) {
+    return <div className="rounded-md border border-border bg-surface-muted/30 px-4 py-8 text-center text-[12.5px] text-muted-foreground">Sin datos para el reporte seleccionado.</div>;
+  }
+
+  const distritoUnicoSeleccionado = new Set(grupos.map((g) => g.distrito).filter(Boolean)).size <= 1;
+  const chartDataGrupoDistrito = grupos.map((g) => ({
+    ...g,
+    etiquetaCorta: distritoUnicoSeleccionado ? g.grupo : `${g.grupo} · ${g.distrito}`,
+    etiquetaCompleta: `${g.grupo} - ${g.distrito}`,
+  }));
+  const chartHeightGrupoDistrito = Math.max(280, chartDataGrupoDistrito.length * 36);
+  const morososTotales = Math.max(total.morosos || 0, 1);
+
+  const tooltipGrupoDistrito = ({ active, payload }: { active?: boolean; payload?: Array<{ payload: typeof chartDataGrupoDistrito[number] }> }) => {
+    if (!active || !payload?.length) return null;
+    const row = payload[0].payload;
+    return (
+      <div className="rounded-md border border-border bg-background px-2.5 py-2 text-xs shadow-sm">
+        <div><span className="font-semibold">Grupo:</span> {row.grupo}</div>
+        <div><span className="font-semibold">Distrito:</span> {row.distrito}</div>
+        <div><span className="font-semibold">Morosos:</span> {numberFmt.format(row.morosos)}</div>
+        <div><span className="font-semibold">% del total:</span> {pctFmt((row.morosos / morososTotales) * 100)}</div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="space-y-5">
+      <KpiBar
+        items={[
+          { label: "Total padrón", value: numberFmt.format(total.totalInmuebles) },
+          { label: "Deudores", value: numberFmt.format(total.deudores), tone: "primary" },
+          { label: "Morosos", value: numberFmt.format(total.morosos), tone: "danger" },
+          { label: "Al día", value: numberFmt.format(total.alDia), tone: "ok" },
+          { label: "% morosidad", value: pctFmt(total.porcentajeMorosidad), tone: "primary" },
+        ]}
+      />
+
+
+      <div className="rounded-md border border-border bg-surface-muted/30 px-3 py-2 text-xs text-muted-foreground">
+        <div>Moroso: inmuebles con {parametroCuotasMoroso} o más cuotas adeudadas.</div>
+        <div>Deudor: inmuebles con entre 1 y {Math.max(parametroCuotasMoroso - 1, 0)} cuotas adeudadas.</div>
+        <div>Al día: inmuebles con 0 cuotas adeudadas.</div>
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <ChartBox id="rep-grupos-chart" title="Morosos por grupo y distrito" height={chartHeightGrupoDistrito}>
+          <BarChart layout="vertical" data={chartDataGrupoDistrito} margin={{ top: 8, right: 16, left: 10, bottom: 8 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#e6e9ef" />
+            <XAxis type="number" tick={{ fontSize: 11 }} />
+            <YAxis type="category" dataKey="etiquetaCorta" tick={{ fontSize: 11 }} width={220} interval={0} />
+            <Tooltip content={tooltipGrupoDistrito} />
+            <Bar dataKey="morosos" radius={[0, 3, 3, 0]}>
+              {chartDataGrupoDistrito.map((_, i) => (
+                <Cell key={i} fill={COLORS_BAR[i % COLORS_BAR.length]} />
+              ))}
+            </Bar>
+          </BarChart>
+        </ChartBox>
+        <ChartBox id="rep-distritos-chart" title="Morosos por distrito">
+          <BarChart data={distritos} margin={{ top: 8, right: 16, left: 0, bottom: 8 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#e6e9ef" />
+            <XAxis dataKey="distrito" tick={{ fontSize: 11 }} />
+            <YAxis tick={{ fontSize: 11 }} />
+            <Tooltip />
+            <Bar dataKey="morosos" radius={[3, 3, 0, 0]}>
+              {distritos.map((_, i) => (
+                <Cell key={i} fill={COLORS_BAR[i % COLORS_BAR.length]} />
+              ))}
+            </Bar>
+          </BarChart>
+        </ChartBox>
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <div>
+          <SectionTitle>Por grupo y distrito</SectionTitle>
+          <DataTable
+            head={["Grupo", "Distrito", "Padrón", "Deudores", "Morosos", "% Morosidad"]}
+            rows={grupos.map((g) => [
+              g.grupo,
+              g.distrito,
+              numberFmt.format(g.totalInmuebles),
+              numberFmt.format(g.deudores),
+              numberFmt.format(g.morosos),
+              pctFmt(g.porcentaje),
+            ])}
+            alignRight={[2, 3, 4, 5]}
+          />
+        </div>
+        <div>
+          <SectionTitle>Por distrito</SectionTitle>
+          <DataTable
+            head={["Distrito", "Padrón", "Deudores", "Morosos", "% Morosidad"]}
+            rows={distritos.map((d) => [
+              d.distrito,
+              numberFmt.format(d.totalInmuebles),
+              numberFmt.format(d.deudores),
+              numberFmt.format(d.morosos),
+              pctFmt(d.porcentaje),
+            ])}
+            alignRight={[1, 2, 3, 4]}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   Reporte 2 / 3 — Acciones por tipo
+   ============================================================ */
+
+function ReporteAcciones({
+  state,
+  tipos,
+  variante,
+  desde = null,
+  hasta = null,
+}: {
+  state: ReporteDataState<AccionesRegularizacionViewModel | { rows: AccionRegistro[] }>;
+  tipos: AccionTipo[];
+  variante: "notificacion" | "regularizacion";
+  desde?: Date | null;
+  hasta?: Date | null;
+}) {
+  const filtradas = useMemo(() => (state.data.rows ?? []).filter((r) => tipos.includes(r.tipo)), [state.data.rows, tipos]);
+  const conteosFallback = useMemo(() => conteoPorTipo(filtradas, tipos), [filtradas, tipos]);
+  const conteos: Array<{ tipo: AccionTipo; cantidad: number; porcentaje?: number }> =
+    (state.data as AccionesRegularizacionViewModel)?.detallePorTipo?.length
+      ? (state.data as AccionesRegularizacionViewModel).detallePorTipo
+      : conteosFallback;
+  const total = filtradas.length;
+  const hasChartData = conteos.some((c) => Number(c.cantidad ?? 0) > 0);
+  if (state.loading) return <div className="text-sm text-muted-foreground">Cargando reporte…</div>;
+  if (state.error) return <div className="text-sm text-destructive">{state.error}</div>;
+  if (state.empty && variante !== "regularizacion") {
+    return <div className="text-sm text-muted-foreground">No hay acciones para el período seleccionado.</div>;
+  }
+
+  return (
+    <div className="space-y-5">
+      <KpiBar
+        items={[
+          { label: "Total acciones", value: numberFmt.format(total), tone: "primary" },
+          ...conteos.slice(0, 3).map((c) => ({
+            label: c.tipo,
+            value: numberFmt.format(c.cantidad),
+          })),
+        ]}
+      />
+
+      <ChartBox
+        id={`rep-acciones-${variante}-chart`}
+        title={variante === "notificacion" ? "Acciones de notificación" : "Acciones de regularización"}
+      >
+        {hasChartData ? (
+          <BarChart data={conteos} margin={{ top: 8, right: 16, left: 0, bottom: 8 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#e6e9ef" />
+            <XAxis dataKey="tipo" tick={{ fontSize: 11 }} />
+            <YAxis tick={{ fontSize: 11 }} />
+            <Tooltip />
+            <Bar dataKey="cantidad" radius={[3, 3, 0, 0]}>
+              {conteos.map((c, i) => (
+                <Cell key={i} fill={COLORS_TIPO[c.tipo] ?? COLORS_BAR[i % COLORS_BAR.length]} />
+              ))}
+            </Bar>
+          </BarChart>
+        ) : (
+          <div className="flex h-[240px] items-center justify-center text-[12.5px] text-muted-foreground">
+            No hay datos para graficar.
+          </div>
+        )}
+      </ChartBox>
+
+      <div>
+        <SectionTitle>Detalle por tipo</SectionTitle>
+        {total === 0 ? (
+          <div className="rounded-md border border-dashed border-border bg-surface-muted/30 px-4 py-6 text-center text-[12.5px] text-muted-foreground">
+            No hay acciones registradas en el período.
+          </div>
+        ) : (
+          <DataTable
+            head={["Tipo de acción", "Cantidad", "% del total"]}
+            rows={conteos.map((c) => [
+              c.tipo,
+              numberFmt.format(c.cantidad),
+              total === 0 ? pctFmt(0) : pctFmt(c.porcentaje ?? (c.cantidad / total) * 100),
+            ])}
+            alignRight={[1, 2]}
+          />
+        )}
+      </div>
+
+      {variante === "regularizacion" && (
+        <>
+          <ReporteAccionesDetalle
+            titulo="Regularizaciones — detalle"
+            descripcion="Inmuebles que regularizaron su situación en el período."
+            acciones={filtradas.filter((a) => a.tipo === "Regularización")}
+            emptyMessage="No hay acciones registradas en el período."
+          />
+          <ReportePlanesDePagoDetalle planes={(state.data as AccionesRegularizacionViewModel).planesDePago ?? []} />
+          <ReporteAccionesDetalle
+            titulo="Compromisos de pago — detalle"
+            descripcion="Compromisos de pago asumidos por los titulares en el período."
+            acciones={filtradas.filter((a) => a.tipo === "Compromiso de pago")}
+            compromisos={(state.data as AccionesRegularizacionViewModel).compromisosDePago ?? []}
+            emptyMessage="No hay compromisos de pago registrados en el período."
+          />
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ============================================================
+   Detalle simple de acciones (regularizaciones / compromisos)
+   ============================================================ */
+
+function ReporteAccionesDetalle({
+  titulo,
+  descripcion,
+  acciones,
+  emptyMessage,
+  compromisos,
+}: {
+  titulo: string;
+  descripcion?: string;
+  acciones: AccionRegistro[];
+  emptyMessage?: string;
+  compromisos?: { fecha: Date; cuenta: string; titular: string; grupo: string; distrito: string; responsable: string }[];
+}) {
+  const PAGE = 15;
+  const [page, setPage] = useState(1);
+  const totalPages = Math.max(1, Math.ceil(acciones.length / PAGE));
+  const safePage = Math.min(page, totalPages);
+  const slice = acciones.slice((safePage - 1) * PAGE, safePage * PAGE);
+
+  return (
+    <div className="space-y-3">
+      <div>
+        <SectionTitle>{titulo}</SectionTitle>
+        {descripcion && (
+          <p className="-mt-1 mb-2 text-[12px] text-muted-foreground">{descripcion}</p>
+        )}
+      </div>
+      {acciones.length === 0 ? (
+        <div className="rounded-md border border-dashed border-border bg-surface-muted/30 px-4 py-6 text-center text-[12.5px] text-muted-foreground">
+          {emptyMessage ?? "Sin registros en el período seleccionado."}
+        </div>
+      ) : (
+        <>
+          <DataTable
+            head={["Fecha", "Cuenta", "Titular", "Grupo", "Distrito", "Responsable"]}
+            rows={(compromisos && compromisos.length > 0 ? compromisos.slice((safePage - 1) * PAGE, safePage * PAGE).map((c) => [
+              dateFmt.format(c.fecha), c.cuenta, c.titular, c.grupo, c.distrito, c.responsable,
+            ]) : slice.map((a) => [dateFmt.format(a.fecha), a.cuenta, a.titular, a.grupo, a.distrito, a.usuario]))}
+          />
+          <Paginador
+            page={safePage}
+            totalPages={totalPages}
+            setPage={setPage}
+            total={acciones.length}
+            pageSize={PAGE}
+          />
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ============================================================
+   Detalle de planes de pago (subtabla del reporte de regularización)
+   ============================================================ */
+
+function ReportePlanesDePagoDetalle({ planes }: { planes: PlanPagoDetalle[] }) {
+  const PAGE = 15;
+  const [page, setPage] = useState(1);
+  const totalPages = Math.max(1, Math.ceil(planes.length / PAGE));
+  const safePage = Math.min(page, totalPages);
+  const slice = planes.slice((safePage - 1) * PAGE, safePage * PAGE);
+
+  const totalCuotas = planes.reduce((acc, p) => acc + p.cuotas, 0);
+  const promedioCuotas = planes.length === 0 ? 0 : totalCuotas / planes.length;
+  const montoTotal = planes.reduce((acc, p) => acc + p.montoTotal, 0);
+
+  return (
+    <div className="space-y-3">
+      <SectionTitle>Planes de pago — detalle</SectionTitle>
+      <KpiBar
+        items={[
+          { label: "Planes en el período", value: numberFmt.format(planes.length), tone: "primary" },
+          { label: "Promedio de cuotas", value: promedioCuotas.toFixed(1) },
+          { label: "Monto comprometido", value: moneyFmt.format(montoTotal) },
+        ]}
+      />
+      {planes.length === 0 ? (
+        <div className="rounded-md border border-dashed border-border bg-surface-muted/30 px-4 py-6 text-center text-[12.5px] text-muted-foreground">
+          No hay planes de pago registrados en el período.
+        </div>
+      ) : (
+        <>
+          <DataTable
+            head={[
+              "Fecha alta",
+              "Cuenta",
+              "Titular",
+              "Grupo",
+              "Cuotas",
+              "Monto total",
+              "Próx. vencimiento",
+              "Vto. final",
+              "Estado",
+            ]}
+            rows={slice.map((p) => [
+              dateFmt.format(p.fechaAlta),
+              p.cuenta,
+              p.titular,
+              p.grupo,
+              numberFmt.format(p.cuotas),
+              moneyFmt.format(p.montoTotal),
+              fmtDateSafe(p.proximoVencimiento),
+              fmtDateSafe(p.vencimientoFinal),
+              p.estado,
+            ])}
+            alignRight={[4, 5]}
+          />
+          <Paginador
+            page={safePage}
+            totalPages={totalPages}
+            setPage={setPage}
+            total={planes.length}
+            pageSize={PAGE}
+          />
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ============================================================
+   Reporte 4 — Estado actual de inmuebles
+   ============================================================ */
+
+function ReporteEstadoInmuebles({
+  state,
+}: {
+  state: ReporteDataState<ReturnType<typeof getReporteEstadoInmueblesViewModel>>;
+}) {
+  const [page, setPage] = useState(1);
+
+  if (state.loading) return <div className="text-sm text-muted-foreground">Cargando reporte…</div>;
+  if (state.error) return <div className="text-sm text-destructive">{state.error}</div>;
+  const reporte = state.data ?? null;
+  const hasTotales = !!reporte?.totales;
+  const rows = Array.isArray(reporte?.rows) ? reporte.rows : [];
+  const distribucionBase = Array.isArray(reporte?.distribucion) ? reporte.distribucion : [];
+
+  if (state.empty || (!hasTotales && rows.length === 0 && distribucionBase.length === 0)) {
+    return <div className="text-sm text-muted-foreground">No hay datos cargados para este reporte.</div>;
+  }
+
+  const totales = reporte?.totales ?? { totalInmuebles: 0, alDia: 0, deudores: 0, morosos: 0, deudaTotal: 0 };
+  const totalInmuebles = Number(totales.totalInmuebles ?? 0);
+  const alDia = Number(totales.alDia ?? 0);
+  const deudores = Number(totales.deudores ?? 0);
+  const morosos = Number(totales.morosos ?? 0);
+  const totalDeuda = Number(totales.deudaTotal ?? 0);
+  const distribucion = distribucionBase.length > 0
+    ? distribucionBase
+    : (hasTotales
+      ? [
+          { estado: "AL_DIA", cantidad: alDia, porcentaje: totalInmuebles === 0 ? 0 : (alDia * 100) / totalInmuebles },
+          { estado: "DEUDOR", cantidad: deudores, porcentaje: totalInmuebles === 0 ? 0 : (deudores * 100) / totalInmuebles },
+          { estado: "MOROSO", cantidad: morosos, porcentaje: totalInmuebles === 0 ? 0 : (morosos * 100) / totalInmuebles },
+        ]
+      : []);
+  const chartData = distribucion.map((d) => ({
+    key: d.estado,
+    name: d.estado === "AL_DIA" ? "Al día" : d.estado === "DEUDOR" ? "Deudores" : "Morosos",
+    value: d.cantidad,
+    pct: d.porcentaje,
+    fill: d.estado === "AL_DIA" ? "hsl(145 35% 38%)" : d.estado === "DEUDOR" ? "hsl(215 75% 38%)" : "hsl(8 78% 50%)",
+  }));
+
+  const PAGE = 25;
+  const totalPages = Math.max(1, Math.ceil(rows.length / PAGE));
+  const slice = rows.slice((page - 1) * PAGE, page * PAGE);
+
+  return (
+    <div className="space-y-5">
+      <KpiBar
+        items={[
+          { label: "Total inmuebles", value: numberFmt.format(totalInmuebles) },
+          { label: "Al día", value: numberFmt.format(alDia), tone: "ok" },
+          { label: "Deudores", value: numberFmt.format(deudores), tone: "primary" },
+          { label: "Morosos", value: numberFmt.format(morosos), tone: "danger" },
+          { label: "Deuda total", value: moneyFmt.format(totalDeuda), tone: "primary" },
+        ]}
+      />
+
+      <ChartBox id="rep-estado-chart" title="Distribución de inmuebles por estado" height={220}>
+        {chartData.length === 0 ? (
+          <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+            No hay datos para graficar.
+          </div>
+        ) : (
+          <PieChart>
+            <Pie
+              data={chartData}
+              dataKey="value"
+              nameKey="name"
+              innerRadius={45}
+              outerRadius={80}
+              paddingAngle={2}
+            />
+            <Tooltip formatter={(value: number, _name, item: { payload?: { pct?: number } }) => `${numberFmt.format(Number(value))} (${pctFmt(Number(item.payload?.pct ?? 0))})`} />
+            <Legend formatter={(value: string, entry: { payload?: { value?: number; pct?: number } }) => `${value} — ${numberFmt.format(Number(entry.payload?.value ?? 0))} (${pctFmt(Number(entry.payload?.pct ?? 0))})`} />
+          </PieChart>
+        )}
+      </ChartBox>
+
+      <div>
+        <SectionTitle>Listado completo del padrón</SectionTitle>
+        {rows.length === 0 ? (
+          <div className="rounded-md border border-dashed border-border bg-surface-muted/30 px-4 py-6 text-center text-[12.5px] text-muted-foreground">
+            No hay inmuebles para mostrar.
+          </div>
+        ) : (
+          <>
+            <DataTable
+              head={["N° cuenta", "Titular", "Grupo", "Distrito", "Estado", "Etapa", "Cuotas", "Deuda"]}
+              rows={slice.map((r) => [
+                r.cuenta,
+                r.titular,
+                r.grupo,
+                r.distrito,
+                r.estado,
+                r.etapa,
+                r.cuotasAdeudadas === 0 ? "—" : numberFmt.format(r.cuotasAdeudadas),
+                r.montoAdeudado === 0 ? "—" : moneyFmt.format(r.montoAdeudado),
+              ])}
+              alignRight={[6, 7]}
+            />
+            <Paginador page={page} totalPages={totalPages} setPage={setPage} total={rows.length} pageSize={PAGE} />
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   Reporte 5 — Acciones entre fechas
+   ============================================================ */
+
+function ReporteAccionesFechas({
+  state,
+}: {
+  state: ReporteDataState<ReturnType<typeof getReporteAccionesFechasViewModel>>;
+}) {
+  const rowsBase = useMemo(() => state.data.rows ?? [], [state.data.rows]);
+  const tiposDisponibles = useMemo(() => crearTipoAccionFiltros(rowsBase), [rowsBase]);
+  const [tiposSeleccionados, setTiposSeleccionados] = useState<string[]>(() => tiposDisponibles.map((t) => t.key));
+  useEffect(() => {
+    setTiposSeleccionados((prev) => {
+      const keys = tiposDisponibles.map((t) => t.key);
+      if (keys.length === 0) return [];
+      if (prev.length === 0) return keys;
+      return prev.filter((k) => keys.includes(k));
+    });
+  }, [tiposDisponibles]);
+
+  const toggleTipo = (key: string) => {
+    setTiposSeleccionados((prev) =>
+      prev.includes(key) ? prev.filter((x) => x !== key) : [...prev, key],
+    );
+  };
+  const seleccionarTodos = () => setTiposSeleccionados(tiposDisponibles.map((t) => t.key));
+  const limpiarTodos = () => setTiposSeleccionados([]);
+
+  const filtradas = useMemo(() => {
+    const selected = new Set(tiposSeleccionados);
+    if (selected.size === 0) return [];
+    return rowsBase.filter((a) => selected.has(normalizarTipoKey(a.codigo ?? a.tipo)));
+  }, [rowsBase, tiposSeleccionados]);
+  const serie = useMemo(() => serieDiaria(filtradas), [filtradas]);
+  const conteos = useMemo(() => conteoPorTipo(filtradas, tiposDisponibles.map((t) => t.label)), [filtradas, tiposDisponibles]);
+  const conteosVisibles = useMemo(
+    () => conteos.filter((c) => tiposSeleccionados.includes(normalizarTipoKey(c.tipo))),
+    [conteos, tiposSeleccionados],
+  );
+
+  const usuariosUnicos = new Set(filtradas.map((a) => a.usuario)).size;
+  const tipoTop = [...conteos].sort((a, b) => b.cantidad - a.cantidad)[0]?.tipo ?? "—";
+  const total = filtradas.length;
+
+  if (state.loading) return <div className="text-sm text-muted-foreground">Cargando reporte…</div>;
+  if (state.error) return <div className="text-sm text-destructive">{state.error}</div>;
+
+  return (
+    <div className="space-y-5">
+      <KpiBar
+        items={[
+          { label: "Total acciones", value: numberFmt.format(total), tone: "primary" },
+          { label: "Días con actividad", value: numberFmt.format(serie.length) },
+          { label: "Usuarios distintos", value: numberFmt.format(usuariosUnicos) },
+          { label: "Tipo más frecuente", value: tipoTop },
+        ]}
+      />
+
+      {/* Filtros por tipo de acción */}
+      <div className="rounded-md border border-border bg-surface-muted/40 px-3 py-2.5">
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex items-center gap-1.5 pr-1 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+            <Filter className="h-3.5 w-3.5" />
+            Tipos
+          </div>
+          {tiposDisponibles.map((t) => {
+            const activo = tiposSeleccionados.includes(t.key);
+            return (
+              <button
+                key={t.key}
+                type="button"
+                onClick={() => toggleTipo(t.key)}
+                className={cn(
+                  "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11.5px] font-medium transition-colors",
+                  activo
+                    ? "border-border bg-surface text-foreground shadow-sm"
+                    : "border-transparent bg-transparent text-muted-foreground hover:text-foreground",
+                )}
+              >
+                <span
+                  className="h-2 w-2 rounded-full"
+                  style={{ backgroundColor: COLORS_TIPO[t.label] ?? "#94a3b8", opacity: activo ? 1 : 0.4 }}
+                />
+                {t.label}
+              </button>
+            );
+          })}
+          {tiposDisponibles.length === 0 && (
+            <span className="text-[12px] text-muted-foreground">No hay tipos de acción disponibles para el período seleccionado.</span>
+          )}
+          <div className="ml-auto flex items-center gap-1">
+            <button
+              type="button"
+              onClick={seleccionarTodos}
+              className="rounded-[4px] px-2 py-1 text-[11.5px] font-medium text-muted-foreground hover:text-foreground"
+            >
+              Todos
+            </button>
+            <span className="text-muted-foreground/60">·</span>
+            <button
+              type="button"
+              onClick={limpiarTodos}
+              className="rounded-[4px] px-2 py-1 text-[11.5px] font-medium text-muted-foreground hover:text-foreground"
+            >
+              Ninguno
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <ChartBox id="rep-acciones-fechas-chart" title="Acciones por día">
+          {serie.length > 0 ? (
+            <LineChart data={serie} margin={{ top: 8, right: 16, left: 0, bottom: 8 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#e6e9ef" />
+              <XAxis dataKey="fechaLabel" tick={{ fontSize: 11 }} />
+              <YAxis tick={{ fontSize: 11 }} />
+              <Tooltip />
+              <Line
+                type="monotone"
+                dataKey="total"
+                stroke="hsl(215 65% 32%)"
+                strokeWidth={2}
+                dot={false}
+              />
+            </LineChart>
+          ) : (
+            <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+              No hay datos para graficar.
+            </div>
+          )}
+        </ChartBox>
+
+        <ChartBox id="rep-acciones-fechas-tipo-chart" title="Acciones por tipo">
+          {conteosVisibles.length > 0 ? (
+            <BarChart data={conteosVisibles} margin={{ top: 8, right: 16, left: 0, bottom: 8 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#e6e9ef" />
+              <XAxis dataKey="tipo" tick={{ fontSize: 10 }} interval={0} angle={-15} textAnchor="end" height={60} />
+              <YAxis tick={{ fontSize: 11 }} />
+              <Tooltip />
+              <Bar dataKey="cantidad" radius={[3, 3, 0, 0]}>
+                {conteosVisibles.map((c, i) => (
+                  <Cell key={i} fill={COLORS_TIPO[c.tipo] ?? COLORS_BAR[i % COLORS_BAR.length]} />
+                ))}
+              </Bar>
+            </BarChart>
+          ) : (
+            <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+              No hay datos para graficar.
+            </div>
+          )}
+        </ChartBox>
+      </div>
+
+      <div>
+        <SectionTitle>Detalle de acciones en el período</SectionTitle>
+        {tiposSeleccionados.length === 0 && (
+          <div className="rounded-md border border-dashed border-border bg-surface-muted/30 px-4 py-6 text-center text-[12.5px] text-muted-foreground">
+            Seleccioná al menos un tipo de acción para ver el detalle.
+          </div>
+        )}
+        {tiposDisponibles.filter((t) => tiposSeleccionados.includes(t.key)).map(({ label: tipo }) => {
+          const tipoKey = normalizarTipoKey(tipo);
+          const rowsTipo = filtradas.filter((a) => normalizarTipoKey(a.codigo ?? a.tipo) === tipoKey);
+          const config: Record<string, { title: string; head: string[]; buildRow: (a: AccionRegistro) => (string | number)[]; alignRight?: number[] }> = {
+            "Aviso de deuda": { title: "Avisos de deuda — detalle", head: ["Fecha", "Cuenta", "Titular", "Grupo", "Distrito", "Usuario/Responsable", "Observación"], buildRow: (a) => [dateFmt.format(a.fecha), a.cuenta, a.titular, a.grupo, a.distrito, fmtTextSafe(a.usuario), fmtTextSafe(a.observacion)] },
+            "Intimación": { title: "Intimaciones — detalle", head: ["Fecha", "Cuenta", "Titular", "Grupo", "Distrito", "Usuario/Responsable", "Observación"], buildRow: (a) => [dateFmt.format(a.fecha), a.cuenta, a.titular, a.grupo, a.distrito, fmtTextSafe(a.usuario), fmtTextSafe(a.observacion)] },
+            "Aviso de corte": { title: "Avisos de corte — detalle", head: ["Fecha", "Cuenta", "Titular", "Grupo", "Distrito", "Usuario/Responsable", "Observación"], buildRow: (a) => [dateFmt.format(a.fecha), a.cuenta, a.titular, a.grupo, a.distrito, fmtTextSafe(a.usuario), fmtTextSafe(a.observacion)] },
+            "Corte": { title: "Cortes — detalle", head: ["Fecha", "Cuenta", "Titular", "Grupo", "Distrito", "Usuario/Responsable", "Observación"], buildRow: (a) => [dateFmt.format(a.fecha), a.cuenta, a.titular, a.grupo, a.distrito, fmtTextSafe(a.usuario), fmtTextSafe(a.observacion)] },
+            "Regularización": { title: "Regularizaciones — detalle", head: ["Fecha", "Cuenta", "Titular", "Grupo", "Distrito", "Monto pagado", "Usuario/Responsable", "Observación"], buildRow: (a) => [dateFmt.format(a.fecha), a.cuenta, a.titular, a.grupo, a.distrito, fmtMoneySafe(a.montoPagado), fmtTextSafe(a.usuario), fmtTextSafe(a.observacion)], alignRight: [5] },
+            "Plan de pago": { title: "Planes de pago — detalle", head: ["Fecha", "Cuenta", "Titular", "Grupo", "Distrito", "Cuotas pagadas", "Monto pagado", "Cuotas pendientes", "Monto pendiente", "Observación", "Usuario/Responsable"], buildRow: (a) => [fmtDateSafe(a.fechaAlta ?? a.fecha), a.cuenta, a.titular, a.grupo, a.distrito, a.cuotasPagadas ?? "—", fmtMoneySafe(a.montoPagado), a.cuotasPendientes ?? "—", fmtMoneySafe(a.montoPendiente), fmtTextSafe(a.observacion), fmtTextSafe(a.usuario)], alignRight: [5, 6, 7, 8] },
+            "Compromiso de pago": { title: "Compromisos de pago — detalle", head: ["Fecha", "Cuenta", "Titular", "Grupo", "Distrito", "Monto comprometido", "Fecha desde", "Fecha hasta", "Estado", "Usuario/Responsable", "Observación"], buildRow: (a) => [dateFmt.format(a.fecha), a.cuenta, a.titular, a.grupo, a.distrito, fmtMoneySafe(a.montoComprometido), fmtDateSafe(a.fechaDesde), fmtDateSafe(a.fechaHasta), fmtTextSafe(a.estado), fmtTextSafe(a.usuario), fmtTextSafe(a.observacion)], alignRight: [5] },
+          };
+          const tableConfig = config[tipo] ?? {
+            title: `${tipo} — detalle`,
+            head: ["Fecha", "Cuenta", "Titular", "Grupo", "Distrito", "Usuario/Responsable", "Observación"],
+            buildRow: (a: AccionRegistro) => [dateFmt.format(a.fecha), a.cuenta, a.titular, a.grupo, a.distrito, fmtTextSafe(a.usuario), fmtTextSafe(a.observacion)],
+          };
+          return (
+            <div key={tipo} className="mt-4">
+              <SectionTitle>{tableConfig.title}</SectionTitle>
+              <DataTable head={tableConfig.head} rows={rowsTipo.map(tableConfig.buildRow)} alignRight={tableConfig.alignRight} emptyMessage="No hay registros para esta acción en el período seleccionado." />
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   Reporte 7 — Historial de movimientos
+   ============================================================ */
+
+const MOVIMIENTO_TIPO_LABEL: Record<MovimientoTipo, string> = {
+  intimacion: "Intimación",
+  corte: "Corte",
+  regularizacion: "Regularización",
+  plan_pago: "Plan de pago",
+  compromiso: "Compromiso",
+  aviso_deuda: "Aviso de deuda",
+  aviso_corte: "Aviso de corte",
+  configuracion: "Configuración",
+};
+
+function ReporteHistorialMovimientos({
+  state,
+}: {
+  state: ReporteDataState<ReturnType<typeof getReporteHistorialMovimientosViewModel>>;
+}) {
+  const baseRows = state.data.rows;
+  const [tipo, setTipo] = useState<MovimientoTipo | "todos">("todos");
+  const [busqueda, setBusqueda] = useState("");
+  const [page, setPage] = useState(1);
+  const PAGE = 25;
+
+  const filtrados = useMemo(() => {
+    const q = busqueda.trim().toLowerCase();
+    return baseRows.filter((m) => {
+      if (tipo !== "todos" && m.tipo !== tipo) return false;
+      if (!q) return true;
+      return (
+        (m.cuenta?.toLowerCase().includes(q) ?? false) ||
+        (m.titular?.toLowerCase().includes(q) ?? false) ||
+        m.usuario.toLowerCase().includes(q) ||
+        m.accion.toLowerCase().includes(q) ||
+        (m.etapa?.toLowerCase().includes(q) ?? false)
+      );
+    });
+  }, [baseRows, tipo, busqueda]);
+
+  const totalPages = Math.max(1, Math.ceil(filtrados.length / PAGE));
+  const safePage = Math.min(page, totalPages);
+  const slice = filtrados.slice((safePage - 1) * PAGE, safePage * PAGE);
+
+  const conteoPorTipoMov = useMemo(() => {
+    const counts: Partial<Record<MovimientoTipo, number>> = {};
+    filtrados.forEach((m) => {
+      counts[m.tipo] = (counts[m.tipo] ?? 0) + 1;
+    });
+    return Object.entries(counts)
+      .map(([k, v]) => ({ tipo: MOVIMIENTO_TIPO_LABEL[k as MovimientoTipo], cantidad: v ?? 0 }))
+      .sort((a, b) => b.cantidad - a.cantidad);
+  }, [filtrados]);
+
+  const tipoTop = conteoPorTipoMov[0]?.tipo ?? "—";
+
+  if (state.loading) return <div className="text-sm text-muted-foreground">Cargando reporte…</div>;
+  if (state.error) return <div className="text-sm text-destructive">{state.error}</div>;
+  if (state.empty) return <div className="text-sm text-muted-foreground">Sin movimientos para mostrar.</div>;
+
+  return (
+    <div className="space-y-5">
+      <KpiBar
+        items={[
+          { label: "Total movimientos", value: numberFmt.format(filtrados.length), tone: "primary" },
+          { label: "Usuarios distintos", value: numberFmt.format(new Set(filtrados.map((m) => m.usuario)).size) },
+          { label: "Tipos representados", value: numberFmt.format(conteoPorTipoMov.length) },
+          { label: "Tipo más frecuente", value: tipoTop },
+        ]}
+      />
+
+      <div className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-surface-muted/40 px-3 py-2">
+        <div className="flex items-center gap-1.5 pr-1 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+          <Filter className="h-3.5 w-3.5" />
+          Filtros
+        </div>
+        <Select
+          value={tipo}
+          onValueChange={(v) => {
+            setTipo(v as MovimientoTipo | "todos");
+            setPage(1);
+          }}
+        >
+          <SelectTrigger className="h-8 w-full text-[12.5px] sm:w-[200px]">
+            <SelectValue placeholder="Tipo de movimiento" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="todos">Todos los tipos</SelectItem>
+            {(Object.keys(MOVIMIENTO_TIPO_LABEL) as MovimientoTipo[]).map((t) => (
+              <SelectItem key={t} value={t}>
+                {MOVIMIENTO_TIPO_LABEL[t]}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Input
+          value={busqueda}
+          onChange={(e) => {
+            setBusqueda(e.target.value);
+            setPage(1);
+          }}
+          placeholder="Buscar por usuario, cuenta, titular o acción…"
+          className="h-8 w-full text-[12.5px] sm:w-[280px]"
+        />
+      </div>
+
+      <div>
+        <SectionTitle>Detalle de movimientos</SectionTitle>
+        <DataTable
+          head={["Fecha", "Usuario", "Acción"]}
+          rows={slice.map((m) => [
+            m.fecha,
+            m.usuario,
+            m.accion,
+          ])}
+        />
+        <Paginador
+          page={safePage}
+          totalPages={totalPages}
+          setPage={setPage}
+          total={filtrados.length}
+          pageSize={PAGE}
+        />
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   Tabla de datos compacta
+   ============================================================ */
+
+function DataTable({
+  head,
+  rows,
+  alignRight = [],
+  emptyMessage = "Sin registros para el período/filtros seleccionados.",
+}: {
+  head: string[];
+  rows: (string | number)[][];
+  alignRight?: number[];
+  emptyMessage?: string;
+}) {
+  return (
+    <div className="overflow-x-auto rounded-md border border-border">
+      <Table>
+        <TableHeader>
+          <TableRow className="border-border bg-surface-muted/60 hover:bg-surface-muted/60">
+            {head.map((h, i) => (
+              <TableHead
+                key={i}
+                className={cn(
+                  "h-9 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground",
+                  alignRight.includes(i) && "text-right",
+                )}
+              >
+                {h}
+              </TableHead>
+            ))}
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {rows.length === 0 && (
+            <TableRow>
+              <TableCell
+                colSpan={head.length}
+                className="h-24 text-center text-[13px] text-muted-foreground"
+              >
+                {emptyMessage}
+              </TableCell>
+            </TableRow>
+          )}
+          {rows.map((r, ri) => (
+            <TableRow key={ri} className="border-border text-[13px]">
+              {r.map((c, ci) => (
+                <TableCell
+                  key={ci}
+                  className={cn(
+                    alignRight.includes(ci) && "text-right tabular",
+                    ci === 0 && "font-medium text-foreground",
+                  )}
+                >
+                  {c}
+                </TableCell>
+              ))}
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </div>
+  );
+}
+
+function Paginador({
+  page,
+  totalPages,
+  setPage,
+  total,
+  pageSize,
+}: {
+  page: number;
+  totalPages: number;
+  setPage: (n: number) => void;
+  total: number;
+  pageSize: number;
+}) {
+  if (total <= pageSize) return null;
+  const start = (page - 1) * pageSize + 1;
+  const end = Math.min(page * pageSize, total);
+  return (
+    <div className="mt-2 flex items-center justify-between text-[12px] text-muted-foreground">
+      <div>
+        Mostrando <span className="tabular font-medium text-foreground">{start}–{end}</span> de{" "}
+        <span className="tabular font-medium text-foreground">{total}</span>
+      </div>
+      <div className="flex items-center gap-1">
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-7 px-2 text-[12px]"
+          disabled={page <= 1}
+          onClick={() => setPage(Math.max(1, page - 1))}
+        >
+          Anterior
+        </Button>
+        <span className="px-2 tabular">
+          {page} / {totalPages}
+        </span>
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-7 px-2 text-[12px]"
+          disabled={page >= totalPages}
+          onClick={() => setPage(Math.min(totalPages, page + 1))}
+        >
+          Siguiente
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   Lógica de exportación
+   ============================================================ */
+
+async function runExport(
+  kind: "pdf" | "xlsx",
+  reporte: ReporteDef,
+  rango: { desde: Date | null; hasta: Date | null },
+  filtrosLabel: string[],
+  reporteState?: ReporteDataState<ReporteExportData>,
+) {
+  const stamp = new Date().toISOString().slice(0, 10);
+  const baseName = reporte.titulo.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  const filename = `${baseName}-${stamp}.${kind === "pdf" ? "pdf" : "xlsx"}`;
+
+  const meta = {
+    organismo: ORGANISMO,
+    titulo: reporte.titulo,
+    subtitulo: reporte.descripcion,
+    filtros: filtrosLabel,
+    generadoEn: new Date(),
+  };
+
+  if (reporte.id === "morosos-grupo-distrito") {
+    const grupos = reporteState?.data?.grupos ?? [];
+    const distritos = reporteState?.data?.distritos ?? [];
+    const total = reporteState?.data?.total ?? { totalInmuebles: 0, deudores: 0, morosos: 0, alDia: 0, porcentajeMorosidad: 0 };
+    const head = ["Categoría", "Grupo", "Distrito", "Padrón", "Deudores", "Morosos", "% Morosidad"];
+    const body: (string | number)[][] = [
+      ...grupos.map((g) => ["Grupo", g.grupo, g.distrito, g.totalInmuebles, g.deudores, g.morosos, pctFmt(g.porcentaje)]),
+      ...distritos.map((d) => ["Distrito", "—", d.distrito, d.totalInmuebles, d.deudores, d.morosos, pctFmt(d.porcentaje)]),
+    ];
+    if (kind === "pdf") {
+      await exportarReportePdf({
+        meta: {
+          ...meta,
+          kpis: [
+            { label: "Total padrón", value: numberFmt.format(total.totalInmuebles) },
+            { label: "Deudores", value: numberFmt.format(total.deudores) },
+            { label: "Morosos", value: numberFmt.format(total.morosos) },
+            { label: "Al día", value: numberFmt.format(total.alDia) },
+            { label: "% morosidad", value: pctFmt(total.porcentajeMorosidad) },
+          ],
+        },
+        chartElementIds: ["rep-grupos-chart", "rep-distritos-chart"],
+        table: { head, body, columnStyles: { 3: { halign: "right" }, 4: { halign: "right" }, 5: { halign: "right" }, 6: { halign: "right" } } },
+        filename,
+      });
+    } else {
+      await exportarReporteXlsx({
+        sheets: [
+          { name: "Por grupo", head: ["Grupo", "Distrito", "Padrón", "Deudores", "Morosos", "% Morosidad"], body: grupos.map((g) => [g.grupo, g.distrito, g.totalInmuebles, g.deudores, g.morosos, pctFmt(g.porcentaje)]) },
+          { name: "Por distrito", head: ["Distrito", "Padrón", "Deudores", "Morosos", "% Morosidad"], body: distritos.map((d) => [d.distrito, d.totalInmuebles, d.deudores, d.morosos, pctFmt(d.porcentaje)]) },
+        ],
+        filename,
+      });
+    }
+    return;
+  }
+
+  if (reporte.id === "acciones-regularizacion") {
+    const tipos = TIPOS_REGULARIZACION;
+    const filtradas = (reporteState?.data?.rows ?? []) as AccionRegistro[];
+    const conteos = (reporteState?.data?.detallePorTipo?.length ? reporteState.data.detallePorTipo : conteoPorTipo(filtradas, tipos));
+    const total = filtradas.length;
+    const head = ["Tipo de acción", "Cantidad", "% del total"];
+    const body = conteos.map((c) => [c.tipo, c.cantidad, total === 0 ? "—" : pctFmt((c.cantidad / total) * 100)]);
+    const chartId = "rep-acciones-regularizacion-chart";
+    const planes = reporteState?.data?.planesDePago ?? [];
+    const regularizaciones = filtradas.filter((a) => a.tipo === "Regularización");
+    const compromisos = filtradas.filter((a) => a.tipo === "Compromiso de pago");
+    const detalleAccionHead = ["Fecha", "Cuenta", "Titular", "Grupo", "Distrito", "Responsable"];
+    const toDetalleBody = (rows: AccionRegistro[]) =>
+      rows.map((a) => [
+        dateFmt.format(a.fecha),
+        a.cuenta,
+        a.titular,
+        a.grupo,
+        a.distrito,
+        a.usuario,
+      ]);
+    const planesHead = [
+      "Fecha alta", "Cuenta", "Titular", "Grupo",
+      "Cuotas", "Monto total",
+      "Próx. vencimiento", "Vto. final", "Estado",
+    ];
+    const planesBody = planes.map((p) => [
+      dateFmt.format(p.fechaAlta),
+      p.cuenta,
+      p.titular,
+      p.grupo,
+      p.cuotas,
+      p.montoTotal,
+      fmtDateSafe(p.proximoVencimiento),
+      fmtDateSafe(p.vencimientoFinal),
+      p.estado,
+    ]);
+    if (kind === "pdf") {
+      const extraTables: NonNullable<Parameters<typeof exportarReportePdf>[0]["extraTables"]> = [];
+      if (regularizaciones.length > 0) {
+        extraTables.push({
+          title: "Regularizaciones — detalle",
+          head: detalleAccionHead,
+          body: toDetalleBody(regularizaciones),
+        });
+      }
+      if (planes.length > 0) {
+        extraTables.push({
+          title: "Planes de pago — detalle",
+          head: ["Fecha", "Cuenta", "Titular", "Grupo", "Cuotas", "Monto total", "Próx. vto.", "Vto. final", "Estado"],
+          body: planes.map((p) => [
+            dateFmt.format(p.fechaAlta),
+            p.cuenta,
+            p.titular,
+            p.grupo,
+            p.cuotas,
+            moneyFmt.format(p.montoTotal),
+            fmtDateSafe(p.proximoVencimiento),
+            fmtDateSafe(p.vencimientoFinal),
+            p.estado,
+          ]),
+          columnStyles: { 4: { halign: "right" }, 5: { halign: "right" } },
+        });
+      }
+      if (compromisos.length > 0) {
+        extraTables.push({
+          title: "Compromisos de pago — detalle",
+          head: detalleAccionHead,
+          body: toDetalleBody(compromisos),
+        });
+      }
+      await exportarReportePdf({
+        meta: {
+          ...meta,
+          kpis: [
+            { label: "Total", value: numberFmt.format(total) },
+            ...conteos.slice(0, 3).map((c) => ({ label: c.tipo, value: numberFmt.format(c.cantidad) })),
+          ],
+        },
+        chartElementIds: [chartId],
+        table: { head, body, columnStyles: { 1: { halign: "right" }, 2: { halign: "right" } } },
+        extraTables: extraTables.length > 0 ? extraTables : undefined,
+        filename,
+      });
+    } else {
+      await exportarReporteXlsx({
+        sheets: [
+          { name: "Resumen", head, body },
+          {
+            name: "Detalle",
+            head: ["Fecha", "Cuenta", "Titular", "Tipo", "Grupo", "Distrito", "Usuario"],
+            body: filtradas.map((a) => [
+              dateFmt.format(a.fecha),
+              a.cuenta,
+              a.titular,
+              a.tipo,
+              a.grupo,
+              a.distrito,
+              a.usuario,
+            ]),
+          },
+          ...(regularizaciones.length > 0
+            ? [{ name: "Regularizaciones", head: detalleAccionHead, body: toDetalleBody(regularizaciones) }]
+            : []),
+          ...(planes.length > 0
+            ? [{ name: "Planes de pago", head: planesHead, body: planesBody }]
+            : []),
+          ...(compromisos.length > 0
+            ? [{ name: "Compromisos de pago", head: detalleAccionHead, body: toDetalleBody(compromisos) }]
+            : []),
+        ],
+        filename,
+      });
+    }
+    return;
+  }
+
+  if (reporte.id === "estado-inmuebles") {
+    const rows = (reporteState?.data?.rows ?? []) as InmuebleEstadoRow[];
+    const morosos = rows.filter((r) => r.estado === "Moroso").length;
+    const deudores = rows.filter((r) => r.estado === "Deudor").length;
+    const alDia = rows.filter((r) => r.estado === "Al día").length;
+    const totalDeuda = rows.reduce((acc, r) => acc + r.montoAdeudado, 0);
+    const head = ["N° cuenta", "Titular", "Grupo", "Distrito", "Estado", "Etapa", "Cuotas", "Deuda"];
+    const body = rows.map((r) => [
+      r.cuenta,
+      r.titular,
+      r.grupo,
+      r.distrito,
+      r.estado,
+      r.etapa,
+      r.cuotasAdeudadas,
+      r.montoAdeudado,
+    ]);
+    if (kind === "pdf") {
+      await exportarReportePdf({
+        meta: {
+          ...meta,
+          kpis: [
+            { label: "Total", value: numberFmt.format(rows.length) },
+            { label: "Al día", value: numberFmt.format(alDia) },
+            { label: "Deudores", value: numberFmt.format(deudores) },
+            { label: "Morosos", value: numberFmt.format(morosos) },
+            { label: "Deuda total", value: moneyFmt.format(totalDeuda) },
+          ],
+        },
+        chartElementIds: ["rep-estado-chart"],
+        table: {
+          head,
+          body: body.map((r) => [
+            r[0], r[1], r[2], r[3], r[4], r[5],
+            r[6] === 0 ? "—" : numberFmt.format(r[6] as number),
+            r[7] === 0 ? "—" : moneyFmt.format(r[7] as number),
+          ]),
+          columnStyles: { 6: { halign: "right" }, 7: { halign: "right" } },
+        },
+        filename,
+      });
+    } else {
+      await exportarReporteXlsx({
+        sheets: [{ name: "Inmuebles", head, body }],
+        filename,
+      });
+    }
+    return;
+  }
+
+  if (reporte.id === "acciones-fechas") {
+    const filtradas = (reporteState?.data?.rows ?? []) as AccionRegistro[];
+    const tiposDinamicos = crearTipoAccionFiltros(filtradas).map((t) => t.label);
+    const conteos = conteoPorTipo(filtradas, tiposDinamicos);
+    const total = filtradas.length;
+    const usuariosUnicos = new Set(filtradas.map((a) => a.usuario)).size;
+    const tipoTop = [...conteos].sort((a, b) => b.cantidad - a.cantidad)[0]?.tipo ?? "—";
+    const head = ["Fecha", "Cuenta", "Titular", "Tipo", "Grupo", "Distrito", "Usuario"];
+    const body = filtradas.map((a) => [
+      dateFmt.format(a.fecha),
+      a.cuenta,
+      a.titular,
+      a.tipo,
+      a.grupo,
+      a.distrito,
+      a.usuario,
+    ]);
+    const resumenHead = ["Tipo de acción", "Cantidad", "% del total"];
+    const resumenBody = conteos.map((c) => [
+      c.tipo,
+      c.cantidad,
+      total === 0 ? "—" : pctFmt((c.cantidad / total) * 100),
+    ]);
+    if (kind === "pdf") {
+      await exportarReportePdf({
+        meta: {
+          ...meta,
+          kpis: [
+            { label: "Total acciones", value: numberFmt.format(total) },
+            { label: "Días con actividad", value: numberFmt.format(serieDiaria(filtradas).length) },
+            { label: "Usuarios distintos", value: numberFmt.format(usuariosUnicos) },
+            { label: "Tipo más frecuente", value: tipoTop },
+          ],
+        },
+        chartElementIds: ["rep-acciones-fechas-chart", "rep-acciones-fechas-tipo-chart"],
+        table: {
+          head: resumenHead,
+          body: resumenBody,
+          columnStyles: { 1: { halign: "right" }, 2: { halign: "right" } },
+        },
+        extraTables: [
+          { title: "Detalle de acciones en el período", head, body },
+        ],
+        filename,
+      });
+    } else {
+      await exportarReporteXlsx({
+        sheets: [
+          { name: "Resumen por tipo", head: resumenHead, body: resumenBody },
+          { name: "Detalle", head, body },
+        ],
+        filename,
+      });
+    }
+    return;
+  }
+
+  if (reporte.id === "historial-movimientos") {
+    const rows = (reporteState?.data?.rows ?? []) as MovimientoRegistro[];
+    const head = ["Fecha", "Usuario", "Acción"];
+    const body = rows.map((m) => [
+      m.fecha,
+      m.usuario,
+      m.accion,
+    ]);
+    if (kind === "pdf") {
+      const tiposUnicos = new Set(rows.map((m) => m.tipo)).size;
+      const usuariosUnicos = new Set(rows.map((m) => m.usuario)).size;
+      await exportarReportePdf({
+        meta: {
+          ...meta,
+          kpis: [
+            { label: "Total movimientos", value: numberFmt.format(rows.length) },
+            { label: "Usuarios distintos", value: numberFmt.format(usuariosUnicos) },
+            { label: "Tipos representados", value: numberFmt.format(tiposUnicos) },
+          ],
+        },
+        chartElementIds: [],
+        table: { head, body },
+        filename,
+      });
+    } else {
+      await exportarReporteXlsx({ sheets: [{ name: "Historial", head, body }], filename });
+    }
+    return;
+  }
+}
+
+/* Marker para evitar tree-shake del import del tipo */
+export type _AccionRegistroExportType = AccionRegistro;

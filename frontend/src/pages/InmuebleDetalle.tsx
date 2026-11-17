@@ -1,0 +1,833 @@
+import { useEffect, useMemo, useState } from "react";
+import { Link, useNavigate, useParams } from "react-router-dom";
+import {
+  ArrowLeft,
+  Save,
+  X,
+  Pencil,
+  History,
+  Receipt,
+  StickyNote,
+  Phone,
+  Mail,
+  MapPin,
+  Building2,
+  Hash,
+  User,
+  ChevronRight,
+  WalletCards,
+  Gauge,
+} from "lucide-react";
+import { AppHeader } from "@/components/layout/AppHeader";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { cn } from "@/lib/utils";
+import { useToast } from "@/hooks/use-toast";
+import { inmueblesApi } from "@/services/api/inmueblesApi";
+import {
+  configuracionApi,
+  extractConfiguracionItems,
+} from "@/services/api/configuracionApi";
+import { mapInmuebleDetalle, type InmuebleDetalleViewModel } from "@/adapters/inmuebleDetalle";
+import { ApiError, USE_API } from "@/lib/apiClient";
+import {
+  mapDistrito,
+  mapGrupo,
+  mapGrupoDistritoRelacion,
+  type GrupoDistritoRelacion,
+} from "@/adapters/configuracionGrupos";
+
+interface ConfigState {
+  grupo: string;
+  distrito: string;
+  grupoId: string;
+  distritoId: string;
+  telefono: string;
+  email: string;
+  activo: boolean;
+  esPrueba: boolean;
+  beneficioCuenta: string;
+  seguimientoHabilitado: boolean;
+  observaciones: string;
+}
+
+export default function InmuebleDetalle() {
+  const { id } = useParams<{ id: string }>();
+  const navigate = useNavigate();
+  const { toast } = useToast();
+
+  const [inmuebleVm, setInmuebleVm] = useState<InmuebleDetalleViewModel | null>(null);
+  const inmueble = inmuebleVm;
+
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [togglingActivo, setTogglingActivo] = useState(false);
+  const [togglingSeguimiento, setTogglingSeguimiento] = useState(false);
+  const [gruposCatalogo, setGruposCatalogo] = useState<Array<{ id: string; nombre: string }>>([]);
+  const [distritosCatalogo, setDistritosCatalogo] = useState<Array<{ id: string; nombre: string }>>([]);
+  const [grupoDistritoConfig, setGrupoDistritoConfig] = useState<GrupoDistritoRelacion[]>([]);
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  const [catalogError, setCatalogError] = useState<string | null>(null);
+  const notFound = !inmueble;
+  const moneyFmt = useMemo(() => new Intl.NumberFormat("es-AR", { style: "currency", currency: "ARS", minimumFractionDigits: 0, maximumFractionDigits: 0 }), []);
+  const dateTimeFmt = useMemo(() => new Intl.DateTimeFormat("es-AR", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }), []);
+
+  const grupoNombreResueltoApi = useMemo(() => {
+    if (!USE_API) return "";
+    const nombrePayload = (inmuebleVm?.grupoNombre ?? "").trim();
+    if (nombrePayload && nombrePayload !== "-") return nombrePayload;
+    if (!inmuebleVm?.grupoId) return "-";
+    return gruposCatalogo.find((g) => g.id === inmuebleVm.grupoId)?.nombre ?? "-";
+  }, [inmuebleVm?.grupoId, inmuebleVm?.grupoNombre, gruposCatalogo]);
+
+  const distritoNombreResueltoApi = useMemo(() => {
+    if (!USE_API) return "";
+    const nombrePayload = (inmuebleVm?.distritoNombre ?? "").trim();
+    if (nombrePayload && nombrePayload !== "-") return nombrePayload;
+    if (!inmuebleVm?.distritoId) return "-";
+    return distritosCatalogo.find((d) => d.id === inmuebleVm.distritoId)?.nombre ?? "-";
+  }, [inmuebleVm?.distritoId, inmuebleVm?.distritoNombre, distritosCatalogo]);
+
+  const initial: ConfigState = useMemo(
+    () => ({
+      grupo: grupoNombreResueltoApi,
+      distrito: distritoNombreResueltoApi,
+      grupoId: inmuebleVm?.grupoId ?? "",
+      distritoId: inmuebleVm?.distritoId ?? "",
+      telefono: inmuebleVm?.telefono ?? "",
+      email: inmuebleVm?.email ?? "",
+      activo: inmuebleVm?.activo ?? true,
+      esPrueba: inmuebleVm?.esPrueba ?? false,
+      beneficioCuenta: inmuebleVm?.beneficioCuenta ?? "",
+      seguimientoHabilitado: inmuebleVm?.seguimientoHabilitado ?? false,
+      observaciones: inmuebleVm?.observaciones ?? "",
+    }),
+    [grupoNombreResueltoApi, distritoNombreResueltoApi, inmuebleVm],
+  );
+
+  const [editing, setEditing] = useState(false);
+  const [config, setConfig] = useState<ConfigState>(initial);
+
+  const dirty = JSON.stringify(config) !== JSON.stringify(initial);
+
+  // Grupos disponibles según el distrito actualmente seleccionado.
+  const gruposDelDistrito = useMemo(() => {
+    if (!config.distritoId) return [];
+    const gruposPermitidos = new Set(
+      grupoDistritoConfig
+        .filter((rel) => rel.distritoId === config.distritoId)
+        .map((rel) => rel.grupoId),
+    );
+    return gruposCatalogo.filter((g) => gruposPermitidos.has(g.id));
+  }, [config.distritoId, gruposCatalogo, grupoDistritoConfig]);
+
+  const apiSelectsDisabled = USE_API
+    && (!!catalogError || catalogLoading || saving || grupoDistritoConfig.length === 0);
+
+  const seguimientoPorParHabilitado = useMemo(
+    () =>
+      grupoDistritoConfig.some(
+        (relacion) =>
+          relacion.grupoId === config.grupoId &&
+          relacion.distritoId === config.distritoId &&
+          relacion.seguimientoHabilitado,
+      ),
+    [config.grupoId, config.distritoId, grupoDistritoConfig],
+  );
+
+  // Elegibilidad efectiva del seguimiento del inmueble.
+  const seguimientoElegible =
+    config.activo && seguimientoPorParHabilitado;
+
+  const fetchInmueble = async (targetId: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await inmueblesApi.getById(targetId);
+      setInmuebleVm(mapInmuebleDetalle(data));
+    } catch (e: unknown) {
+      setInmuebleVm(null);
+      setError(e instanceof ApiError ? e.message : "No se pudo cargar el inmueble.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSave = async () => {
+    if (!id) return;
+    if (!USE_API) {
+      setError("Funcionalidad pendiente de integración.");
+      return;
+    }
+    try {
+      setSaving(true);
+      await inmueblesApi.update(id, {
+        telefono: config.telefono,
+        esPrueba: config.esPrueba,
+        beneficioCuenta: config.beneficioCuenta,
+        email: config.email,
+        observacion: config.observaciones || undefined,
+        grupoId: config.grupoId || undefined,
+        distritoId: config.distritoId || undefined,
+      });
+      await fetchInmueble(id);
+      setEditing(false);
+      toast({ title: "Cambios guardados", description: "El inmueble fue actualizado correctamente." });
+    } catch (e: unknown) {
+      toast({
+        title: "Error al guardar",
+        description: e instanceof ApiError ? e.message : "No se pudieron guardar los cambios.",
+        variant: "destructive",
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleCancel = () => {
+    setConfig(initial);
+    setEditing(false);
+  };
+
+  const handleToggleActivo = async (nextActivo: boolean) => {
+    if (!editing || !id) return;
+    if (!USE_API) {
+      setError("Funcionalidad pendiente de integración.");
+      return;
+    }
+    try {
+      setTogglingActivo(true);
+      await inmueblesApi.toggleActivo(id, nextActivo);
+      await fetchInmueble(id);
+      toast({ title: nextActivo ? "Inmueble activado" : "Inmueble inactivado" });
+    } catch (e: unknown) {
+      toast({
+        title: "Error al actualizar estado",
+        description: e instanceof ApiError ? e.message : "No se pudo actualizar el estado del inmueble.",
+        variant: "destructive",
+      });
+    } finally {
+      setTogglingActivo(false);
+    }
+  };
+
+  const handleToggleSeguimiento = async (nextSeguimientoHabilitado: boolean) => {
+    if (!editing || !id) return;
+    if (!USE_API) {
+      setError("Funcionalidad pendiente de integración.");
+      return;
+    }
+    try {
+      setTogglingSeguimiento(true);
+      await inmueblesApi.toggleSeguimiento(id, nextSeguimientoHabilitado);
+      await fetchInmueble(id);
+      toast({ title: nextSeguimientoHabilitado ? "Seguimiento habilitado" : "Seguimiento deshabilitado" });
+    } catch (e: unknown) {
+      toast({
+        title: "Error al actualizar seguimiento",
+        description: e instanceof ApiError ? e.message : "No se pudo actualizar el seguimiento.",
+        variant: "destructive",
+      });
+    } finally {
+      setTogglingSeguimiento(false);
+    }
+  };
+
+
+  useEffect(() => {
+    if (!USE_API) {
+      setCatalogError("Funcionalidad pendiente de integración.");
+      setGruposCatalogo([]);
+      setDistritosCatalogo([]);
+      setGrupoDistritoConfig([]);
+      return;
+    }
+    const loadCatalogos = async () => {
+      try {
+        setCatalogLoading(true);
+        setCatalogError(null);
+        const [gs, ds, rel] = await Promise.all([
+          configuracionApi.grupos({ size: 500 }),
+          configuracionApi.distritos({ size: 500 }),
+          configuracionApi.grupoDistritoConfig({ size: 1000 }),
+        ]);
+        setGruposCatalogo(
+          extractConfiguracionItems(gs)
+            .map((item) => mapGrupo(item))
+            .filter((grupo) => grupo.id && grupo.nombre)
+            .map(({ id, nombre }) => ({ id, nombre })),
+        );
+        setDistritosCatalogo(
+          extractConfiguracionItems(ds)
+            .map(mapDistrito)
+            .filter((distrito) => distrito.id && distrito.nombre)
+            .map(({ id, nombre }) => ({ id, nombre })),
+        );
+        setGrupoDistritoConfig(
+          extractConfiguracionItems(rel)
+            .map(mapGrupoDistritoRelacion)
+            .filter((relacion) => relacion.grupoId && relacion.distritoId),
+        );
+      } catch (catalogLoadError: unknown) {
+        setCatalogError(
+          catalogLoadError instanceof Error
+            ? catalogLoadError.message
+            : "No se pudieron cargar los catálogos de grupos y distritos.",
+        );
+      } finally {
+        setCatalogLoading(false);
+      }
+    };
+    loadCatalogos();
+  }, []);
+
+  useEffect(() => {
+    if (!id) return;
+    if (!USE_API) {
+      setInmuebleVm(null);
+      setError("Funcionalidad pendiente de integración.");
+      return;
+    }
+    fetchInmueble(id);
+  }, [id]);
+
+  useEffect(() => {
+    setConfig(initial);
+    setEditing(false);
+  }, [initial]);
+
+  if (loading) {
+    return (
+      <>
+        <AppHeader title="Inmueble" breadcrumb={[{ label: "Inmuebles", to: "/inmuebles" }, { label: "Detalle" }]} />
+        <main className="flex-1 px-4 py-8 sm:px-6 sm:py-10">
+          <div className="rounded-md border border-border bg-surface p-8 text-center text-[13px] text-muted-foreground">
+            Cargando inmueble...
+          </div>
+        </main>
+      </>
+    );
+  }
+
+  if (error) {
+    return (
+      <>
+        <AppHeader title="Error al cargar inmueble" breadcrumb={[{ label: "Inmuebles", to: "/inmuebles" }, { label: "Detalle" }]} />
+        <main className="flex-1 px-4 py-8 sm:px-6 sm:py-10">
+          <div className="rounded-md border border-destructive/30 bg-destructive/10 p-8 text-center text-[13px] text-destructive">
+            {error}
+          </div>
+        </main>
+      </>
+    );
+  }
+
+  if (notFound) {
+    return (
+      <>
+        <AppHeader
+          title="Inmueble no encontrado"
+          breadcrumb={[{ label: "Inmuebles", to: "/inmuebles" }, { label: "Detalle" }]}
+        />
+        <main className="flex-1 px-4 py-8 sm:px-6 sm:py-10">
+          <div className="rounded-md border border-border bg-surface p-8 text-center text-[13px] text-muted-foreground">
+            El inmueble solicitado no existe o fue dado de baja.
+            <div className="mt-4">
+              <Button variant="outline" size="sm" asChild>
+                <Link to="/inmuebles">Volver al listado</Link>
+              </Button>
+            </div>
+          </div>
+        </main>
+      </>
+    );
+  }
+
+  return (
+    <>
+      <AppHeader
+        title={`Inmueble · ${inmueble.cuenta}`}
+        description={inmueble.titular}
+        breadcrumb={[
+          { label: "Inmuebles", to: "/inmuebles" },
+          { label: inmueble.cuenta },
+        ]}
+        actions={
+          <>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-9 gap-2"
+              onClick={() => navigate("/inmuebles")}
+            >
+              <ArrowLeft className="h-4 w-4" />
+              Volver al listado
+            </Button>
+            {!editing ? (
+              <Button size="sm" className="h-9 gap-2" onClick={() => setEditing(true)}>
+                <Pencil className="h-4 w-4" />
+                Editar configuración
+              </Button>
+            ) : (
+              <>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-9 gap-2"
+                  onClick={handleCancel}
+                >
+                  <X className="h-4 w-4" />
+                  Cancelar
+                </Button>
+                <Button
+                  size="sm"
+                  className="h-9 gap-2"
+                  onClick={handleSave}
+                  disabled={!dirty || saving}
+                >
+                  <Save className="h-4 w-4" />
+                  Guardar cambios
+                </Button>
+              </>
+            )}
+          </>
+        }
+      />
+
+      <main className="flex-1 space-y-6 px-4 py-4 sm:px-6 sm:py-6">
+        {/* Bloque superior: datos principales */}
+        <section className="rounded-md border border-border bg-surface shadow-sm">
+          <SectionHeader
+            title="Datos del inmueble"
+            subtitle="Información identificatoria registrada en el padrón"
+          />
+          <div className="grid grid-cols-1 gap-x-8 gap-y-4 px-5 py-5 md:grid-cols-2 lg:grid-cols-3">
+            <DataField icon={Hash} label="N° de cuenta" value={inmueble.cuenta} mono />
+            <DataField icon={User} label="Titular" value={inmueble.titular} />
+            <DataField
+              icon={MapPin}
+              label="Dirección"
+              value={inmueble.direccion}
+            />
+            <DataField icon={MapPin} label="Distrito" value={config.distrito} />
+            <DataField icon={Building2} label="Grupo" value={config.grupo} />
+            <DataField
+              label="Estado"
+              value={
+                <EstadoPill activo={config.activo} />
+              }
+            />
+            <DataField icon={Phone} label="Teléfono de contacto" value={config.telefono} mono />
+            <DataField icon={Mail} label="Email" value={config.email} />
+            <DataField
+              label="Seguimiento de morosidad"
+              value={
+                <span className="text-[13px] text-foreground">
+                  {config.seguimientoHabilitado && seguimientoElegible
+                    ? "Habilitado"
+                    : "Deshabilitado"}
+                </span>
+              }
+            />
+          </div>
+        </section>
+
+        {/* Configuración editable + accesos */}
+        <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+          <section className="rounded-md border border-border bg-surface shadow-sm lg:col-span-2">
+            <SectionHeader
+              title="Configuración operativa"
+              subtitle="Parámetros editables del inmueble"
+            />
+            <div className="grid grid-cols-1 gap-4 px-5 py-5 md:grid-cols-2">
+              {USE_API && catalogError && (
+                <div className="md:col-span-2 rounded-md border border-destructive/30 bg-destructive/10 p-2 text-[12px] text-destructive">
+                  No se pudieron cargar los catálogos de grupo y distrito desde backend.
+                </div>
+              )}
+              <FieldGroup label="Distrito">
+                <Select
+                  value={config.distritoId}
+                  onValueChange={(v) => {
+                    // Al cambiar de distrito, validamos que el grupo siga siendo válido.
+                      const distritoSel = distritosCatalogo.find((d) => d.id === v);
+                      const gruposPermitidos = gruposCatalogo.filter((g) =>
+                        grupoDistritoConfig.some((rel) => rel.distritoId === v && rel.grupoId === g.id),
+                      );
+                      const grupoSigueValido = gruposPermitidos.some((g) => g.id === config.grupoId);
+                      const grupoActualNombre = grupoSigueValido
+                        ? (gruposPermitidos.find((g) => g.id === config.grupoId)?.nombre ?? config.grupo)
+                        : "";
+                      setConfig({
+                        ...config,
+                        distritoId: v,
+                        distrito: distritoSel?.nombre ?? "",
+                        grupoId: grupoSigueValido ? config.grupoId : "",
+                        grupo: grupoActualNombre,
+                      });
+                      return;
+                  }}
+                  disabled={!editing || apiSelectsDisabled}
+                >
+                  <SelectTrigger className="h-9 text-[13px]">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {distritosCatalogo.map((d) => (
+                      <SelectItem key={d.id} value={d.id} className="text-[13px]">
+                        {d.nombre}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </FieldGroup>
+
+              <FieldGroup label="Grupo">
+                <Select
+                  value={config.grupoId}
+                  onValueChange={(v) => {
+                    const grupoSel = gruposCatalogo.find((g) => g.id === v);
+                    setConfig({ ...config, grupoId: v, grupo: grupoSel?.nombre ?? "" });
+                  }}
+                  disabled={!editing || gruposDelDistrito.length === 0 || apiSelectsDisabled}
+                >
+                  <SelectTrigger className="h-9 text-[13px]">
+                    <SelectValue
+                      placeholder={
+                        gruposDelDistrito.length === 0
+                          ? "Sin grupos en este distrito"
+                          : "Seleccionar grupo..."
+                      }
+                    />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {gruposDelDistrito.map((g) => (
+                      <SelectItem key={g.id} value={g.id} className="text-[13px]">
+                        {g.nombre}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-[11.5px] text-muted-foreground">
+                  Catálogo de grupos provisto por backend.
+                </p>
+                {USE_API && catalogError && (
+                  <p className="text-[11.5px] text-destructive">No se pudieron cargar grupos/distritos desde backend.</p>
+                )}
+                {USE_API && grupoDistritoConfig.length === 0 && !catalogLoading && !catalogError && (
+                  <p className="text-[11.5px] text-destructive">No hay relaciones grupo-distrito disponibles para editar.</p>
+                )}
+              </FieldGroup>
+
+              <FieldGroup label="Teléfono de contacto">
+                <Input
+                  value={config.telefono}
+                  onChange={(e) => setConfig({ ...config, telefono: e.target.value })}
+                  disabled={!editing}
+                  className="h-9 text-[13px]"
+                />
+              </FieldGroup>
+
+              <FieldGroup label="Email">
+                <Input
+                  type="email"
+                  value={config.email}
+                  onChange={(e) => setConfig({ ...config, email: e.target.value })}
+                  disabled={!editing}
+                  className="h-9 text-[13px]"
+                />
+              </FieldGroup>
+
+              <FieldGroup label="Beneficio de la cuenta">
+                <Select disabled={!editing || saving} value={config.beneficioCuenta || "NINGUNO"}
+                  onValueChange={value => setConfig({ ...config, beneficioCuenta: value === "NINGUNO" ? "" : value })}>
+                  <SelectTrigger aria-label="Beneficio de la cuenta"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="NINGUNO">Sin beneficio informado</SelectItem>
+                    {["Jubilados", "Discapacidad", "Tarifa social"].map(tipo =>
+                      <SelectItem key={tipo} value={tipo}>{tipo}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </FieldGroup>
+              <ToggleRow
+                label="Cuenta de prueba"
+                hint="Se excluye de los reportes y de las nuevas cargas de facturación y pagos."
+                checked={config.esPrueba}
+                disabled={!editing || saving}
+                onCheckedChange={(value) => setConfig({ ...config, esPrueba: value })}
+              />
+              <ToggleRow
+                label="Inmueble activo"
+                hint="Si se desactiva, no se generarán nuevas gestiones."
+                checked={config.activo}
+                disabled={!editing || togglingActivo}
+                onCheckedChange={handleToggleActivo}
+              />
+
+              <ToggleRow
+                label="Seguimiento de morosidad"
+                hint="El backend define la elegibilidad de seguimiento para este inmueble."
+                checked={config.seguimientoHabilitado}
+                disabled={
+                  !editing || !config.activo || !seguimientoPorParHabilitado || togglingSeguimiento
+                }
+                onCheckedChange={handleToggleSeguimiento}
+              />
+
+              <div className="md:col-span-2">
+                <FieldGroup label="Observaciones internas">
+                  <Textarea
+                    value={config.observaciones}
+                    onChange={(e) =>
+                      setConfig({ ...config, observaciones: e.target.value })
+                    }
+                    disabled={!editing}
+                    placeholder="Notas operativas visibles solo para el personal del organismo."
+                    rows={4}
+                    className="resize-none text-[13px]"
+                  />
+                </FieldGroup>
+              </div>
+            </div>
+          </section>
+
+          {/* Accesos relacionados */}
+          <aside className="space-y-4">
+            <section className="rounded-md border border-border bg-surface shadow-sm">
+              <SectionHeader title="Accesos relacionados" />
+              <div className="flex flex-col">
+                <AccessRow
+                  icon={History}
+                  title="Historial de seguimiento"
+                  description="Avisos, intimaciones y cortes registrados."
+                  to={`/inmuebles/${inmueble.id}/seguimiento`}
+                />
+                <AccessRow
+                  icon={Receipt}
+                  title="Historial de deuda"
+                  description="Historial de períodos y saldos adeudados."
+                  to={`/inmuebles/${inmueble.id}/historial-deuda`}
+                />
+                <AccessRow
+                  icon={StickyNote}
+                  title="Observaciones del expediente"
+                  description="Notas y documentos cargados al inmueble."
+                  to={`/inmuebles/${inmueble.id}/observaciones-expediente`}
+                  last
+                />
+              </div>
+            </section>
+
+            <section className="rounded-md border border-border bg-surface shadow-sm">
+              <SectionHeader title="Resumen operativo" />
+              <dl className="divide-y divide-border text-[12.5px]">
+                <ResumenRow label="Última gestión" value={formatUltimaGestion(inmueble.resumenOperativo.ultimaGestion, dateTimeFmt)} />
+                <ResumenRow label="Etapa actual" value={formatEtapaActual(inmueble.resumenOperativo.etapaActualNombre, inmueble.resumenOperativo.estadoProceso)} />
+                <ResumenRow label="Períodos adeudados" value={String(inmueble.resumenOperativo.periodosAdeudados)} mono />
+                <ResumenRow label="Monto adeudado" value={moneyFmt.format(inmueble.resumenOperativo.montoAdeudado)} mono />
+                <ResumenRow label="Última carga de deuda" value={formatUltimaGestion(inmueble.resumenOperativo.ultimaCargaDeuda, dateTimeFmt)} />
+              </dl>
+            </section>
+          </aside>
+        </div>
+      </main>
+    </>
+  );
+}
+
+function formatUltimaGestion(value: string | null, fmt: Intl.DateTimeFormat): string {
+  if (!value) return "Sin gestiones registradas";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "Sin gestiones registradas" : fmt.format(date);
+}
+
+function formatEtapaActual(etapaActualNombre: string | null, estadoProceso: string | null): string {
+  if (etapaActualNombre && etapaActualNombre.trim()) return etapaActualNombre;
+  if (estadoProceso === "CERRADO") return "Proceso cerrado";
+  return "Sin proceso iniciado";
+}
+
+function formatFecha(value: string | null): string {
+  if (!value) return "Sin pagos informados";
+  const [year, month, day] = value.split("-");
+  return year && month && day ? `${day}/${month}/${year}` : value;
+}
+
+/* ---------- Subcomponentes ---------- */
+
+function SectionHeader({ title, subtitle }: { title: string; subtitle?: string }) {
+  return (
+    <div className="border-b border-border bg-surface-muted/40 px-5 py-3">
+      <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+        {title}
+      </div>
+      {subtitle && (
+        <div className="mt-0.5 text-[12px] text-muted-foreground/80">{subtitle}</div>
+      )}
+    </div>
+  );
+}
+
+function DataField({
+  icon: Icon,
+  label,
+  value,
+  mono,
+}: {
+  icon?: React.ComponentType<{ className?: string }>;
+  label: string;
+  value: React.ReactNode;
+  mono?: boolean;
+}) {
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+        {Icon && <Icon className="h-3 w-3" />}
+        {label}
+      </div>
+      <div
+        className={cn(
+          "text-[13.5px] text-foreground",
+          mono && "tabular font-medium",
+        )}
+      >
+        {value}
+      </div>
+    </div>
+  );
+}
+
+function FieldGroup({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <Label className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+        {label}
+      </Label>
+      {children}
+    </div>
+  );
+}
+
+function ToggleRow({
+  label,
+  hint,
+  checked,
+  disabled,
+  onCheckedChange,
+}: {
+  label: string;
+  hint?: string;
+  checked: boolean;
+  disabled?: boolean;
+  onCheckedChange: (v: boolean) => void;
+}) {
+  return (
+    <div
+      className={cn(
+        "flex items-start justify-between gap-3 rounded-md border border-border bg-surface-muted/30 px-3 py-2.5",
+        disabled && "opacity-70",
+      )}
+    >
+      <div>
+        <div className="text-[12.5px] font-medium text-foreground">{label}</div>
+        {hint && (
+          <div className="mt-0.5 text-[11.5px] text-muted-foreground">{hint}</div>
+        )}
+      </div>
+      <Switch
+        checked={checked}
+        disabled={disabled}
+        onCheckedChange={onCheckedChange}
+      />
+    </div>
+  );
+}
+
+function AccessRow({
+  icon: Icon,
+  title,
+  description,
+  to,
+  last,
+}: {
+  icon: React.ComponentType<{ className?: string }>;
+  title: string;
+  description: string;
+  to: string;
+  last?: boolean;
+}) {
+  return (
+    <Link
+      to={to}
+      className={cn(
+        "group flex items-center gap-3 px-4 py-3 transition-colors hover:bg-surface-muted/50",
+        !last && "border-b border-border",
+      )}
+    >
+      <div className="flex h-8 w-8 items-center justify-center rounded-md border border-border bg-surface-muted/60 text-muted-foreground group-hover:text-foreground">
+        <Icon className="h-4 w-4" />
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="text-[13px] font-medium text-foreground">{title}</div>
+        <div className="truncate text-[11.5px] text-muted-foreground">{description}</div>
+      </div>
+      <ChevronRight className="h-4 w-4 text-muted-foreground/70 transition-transform group-hover:translate-x-0.5 group-hover:text-foreground" />
+    </Link>
+  );
+}
+
+function ResumenRow({
+  label,
+  value,
+  mono,
+}: {
+  label: string;
+  value: React.ReactNode;
+  mono?: boolean;
+}) {
+  return (
+    <div className="flex items-center justify-between px-4 py-2.5">
+      <dt className="text-muted-foreground">{label}</dt>
+      <dd className={cn("text-foreground", mono && "tabular font-medium")}>{value}</dd>
+    </div>
+  );
+}
+
+function EstadoPill({ activo }: { activo: boolean }) {
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11.5px] font-medium",
+        activo
+          ? "border-status-active/20 bg-status-active-soft text-status-active"
+          : "border-border bg-muted text-muted-foreground",
+      )}
+    >
+      <span
+        aria-hidden
+        className={cn(
+          "h-1.5 w-1.5 rounded-full",
+          activo ? "bg-status-active" : "bg-muted-foreground/60",
+        )}
+      />
+      {activo ? "Activo" : "Inactivo"}
+    </span>
+  );
+}

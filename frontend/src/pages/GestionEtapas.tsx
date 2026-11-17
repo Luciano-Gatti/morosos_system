@@ -1,0 +1,2781 @@
+import { extractConfiguracionItems } from "@/services/api/configuracionApi";
+import type { SeguimientoResultado } from "@/services/api/seguimientoApi";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  Filter,
+  Search,
+  CalendarClock,
+  PlayCircle,
+  StopCircle,
+  ArrowRight,
+  ArrowRightCircle,
+  HandCoins,
+  ChevronsRight,
+  X,
+  AlertTriangle,
+  CalendarIcon,
+  Layers,
+  Building2,
+  RotateCcw,
+  PauseCircle,
+  CheckCircle2,
+  ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
+  FileText,
+  WalletCards,
+} from "lucide-react";
+import { AppHeader } from "@/components/layout/AppHeader";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Calendar } from "@/components/ui/calendar";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { format } from "date-fns";
+import { es } from "date-fns/locale";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
+import { useToast } from "@/hooks/use-toast";
+import { USE_API, ApiError } from "@/lib/apiClient";
+import { cn } from "@/lib/utils";
+import type { EtapaSeguimiento, EstadoProceso, InmuebleMoroso } from "@/types/seguimiento";
+import { seguimientoApi } from "@/services/api/seguimientoApi";
+import { configuracionApi } from "@/services/api/configuracionApi";
+import { mapSeguimientoBandejaRow, type SeguimientoRow } from "@/adapters/seguimiento";
+import { normalizePageResponse, normalizeSpringPage } from "@/adapters/pagination";
+import { Link } from "react-router-dom";
+import { Settings2 } from "lucide-react";
+
+const numberFmt = new Intl.NumberFormat("es-AR");
+const moneyFmt = new Intl.NumberFormat("es-AR", {
+  style: "currency",
+  currency: "ARS",
+  maximumFractionDigits: 0,
+});
+const dateFmt = new Intl.DateTimeFormat("es-AR", {
+  day: "2-digit",
+  month: "2-digit",
+  year: "numeric",
+});
+
+const UMBRAL_VISUAL_DEFAULT = 0;
+
+function etapaIndexEnLista(e: EtapaSeguimiento | null, etapas: EtapaSeguimiento[]): number {
+  if (!e) return -1;
+  return etapas.indexOf(e);
+}
+
+function etapaSiguienteEnLista(e: EtapaSeguimiento | null, etapas: EtapaSeguimiento[]): EtapaSeguimiento | null {
+  const i = etapaIndexEnLista(e, etapas);
+  if (etapas.length === 0) return null;
+  if (i === -1) return etapas[0];
+  if (i >= etapas.length - 1) return null;
+  return etapas[i + 1];
+}
+
+const PAGE_SIZE = 15;
+
+type EtapaFiltro = "all" | "sin-etapa" | string;
+type EstadoBackend = "ABIERTO" | "PAUSADO" | "CERRADO";
+type EstadoFiltro = "all" | EstadoBackend;
+type SortDir = "asc" | "desc";
+type SortKey = "cuenta" | "titular" | "direccion" | "grupo" | "distrito" | "cuotas" | "montoAdeudado" | "etapaActual" | "fechaProgramada" | "estado";
+
+type AccionMasiva =
+  | { kind: "enviar-etapa"; etapa: EtapaSeguimiento }
+  | { kind: "enviar-siguiente" }
+  | { kind: "repetir-etapa" }
+  | { kind: "iniciar" }
+  | { kind: "pausar" }
+  | { kind: "reanudar" }
+  | { kind: "cerrar" }
+  | { kind: "compromiso" }
+  | { kind: "observacion-etapa" };
+
+type AccionesDisponiblesRow = {
+  puedeIniciar?: boolean;
+  puedeAvanzar?: boolean;
+  puedeRepetir?: boolean;
+  puedePausar?: boolean;
+  puedeReabrir?: boolean;
+  puedeCerrar?: boolean;
+  puedeRegistrarCompromiso?: boolean;
+} | null | undefined;
+
+export type BulkSeguimientoPayload = {
+  ids: string[];
+  observacion?: string;
+};
+
+export type CerrarProcesoPayload = {
+  casoSeguimientoId: string;
+  motivoCodigo: string;
+  observacion?: string;
+  montoAbonado?: number;
+  planPago?: {
+    montoTotalPlan: number;
+    cantidadTotalCuotas: number;
+    cantidadCuotasQuePagaAhora: number;
+    fechaVencimientoPrimeraCuota: string;
+  };
+  cambioParametro?: {
+    parametro: string;
+    valorAnterior: string;
+    valorNuevo: string;
+  };
+};
+
+export type CompromisoPagoPayload = {
+  casoSeguimientoId: string;
+  fechaDesde: string;
+  fechaHasta: string;
+  montoComprometido?: number;
+  observacion?: string;
+};
+
+type MotivoCierreOption = {
+  codigo: string;
+  nombre: string;
+};
+type CatalogOption = {
+  id: string;
+  nombre: string;
+};
+
+type CompromisoVigente = { id: string; fechaDesde: string; fechaHasta: string; montoComprometido?: number; observacion?: string; estado?: string };
+
+type AccionDialogConfirmPayload =
+  | { kind: "enviar-etapa"; payload: Omit<BulkSeguimientoPayload, "ids"> & { etapaDestinoId: string; repetirMismaEtapa?: boolean } }
+  | { kind: "enviar-siguiente" | "repetir-etapa" | "iniciar" | "reanudar"; payload: Omit<BulkSeguimientoPayload, "ids"> }
+  | { kind: "observacion-etapa"; payload: { observacion: string } }
+  | { kind: "pausar"; payload: Omit<BulkSeguimientoPayload, "ids"> & { motivoPausa: string } }
+  | { kind: "cerrar"; payload: Omit<CerrarProcesoPayload, "casoSeguimientoId"> }
+  | { kind: "compromiso"; payload: Omit<CompromisoPagoPayload, "casoSeguimientoId"> & { compromisoId?: string } };
+
+
+export default function GestionEtapas() {
+  const { toast } = useToast();
+  // Este valor es solo visual hasta cargar /parametros-seguimiento.
+  const [umbralCuotas, setUmbralCuotas] = useState<number>(UMBRAL_VISUAL_DEFAULT);
+
+  // Universo base: solo los inmuebles que cumplen con el umbral configurado en
+  // /configuracion/seguimiento. El resto no debe aparecer en gestión de etapas.
+  const excluidosPorUmbral = 0;
+
+  const [query, setQuery] = useState("");
+  const [etapaFiltro, setEtapaFiltro] = useState<EtapaFiltro>("all");
+  const [estadoFiltro, setEstadoFiltro] = useState<EstadoFiltro>("all");
+  const [grupo, setGrupo] = useState<string>("all");
+  const [distrito, setDistrito] = useState<string>("all");
+  const [cuotasMin, setCuotasMin] = useState<string>("");
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [page, setPage] = useState(1);
+  const [sortKey, setSortKey] = useState<SortKey>("cuenta");
+  const [sortDir, setSortDir] = useState<SortDir>("asc");
+  const [accion, setAccion] = useState<AccionMasiva | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [mutating, setMutating] = useState(false);
+  const [compromisoDialogLoading, setCompromisoDialogLoading] = useState(false);
+  const [compromisoVigente, setCompromisoVigente] = useState<CompromisoVigente | null>(null);
+  const [rows, setRows] = useState<SeguimientoRow[]>([]);
+  const [totalElements, setTotalElements] = useState(0);
+  const [totalPages, setTotalPages] = useState(1);
+  const [gruposApi, setGruposApi] = useState<CatalogOption[]>([]);
+  const [distritosApi, setDistritosApi] = useState<CatalogOption[]>([]);
+  const [etapasApi, setEtapasApi] = useState<CatalogOption[]>([]);
+  const [motivosCierreApi, setMotivosCierreApi] = useState<MotivoCierreOption[]>([]);
+  const [catalogError, setCatalogError] = useState<string | null>(null);
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  const [catalogWarnings, setCatalogWarnings] = useState<string[]>([]);
+  const universoMorosos = useMemo(() => rows, [rows]);
+  const etapasOperativas = etapasApi.map((e) => e.nombre as EtapaSeguimiento);
+  const etapaIdByNombre = useMemo(
+    () => new Map(etapasApi.map((e) => [e.nombre, e.id])),
+    [etapasApi],
+  );
+
+  useEffect(() => {
+    const loadCatalogs = async () => {
+      if (!USE_API) return;
+      try {
+        setCatalogLoading(true);
+        setCatalogError(null);
+        setCatalogWarnings([]);
+        const [gs, ds, es, ps, ms] = await Promise.allSettled([
+          configuracionApi.grupos(),
+          configuracionApi.distritos(),
+          configuracionApi.etapas(),
+          configuracionApi.parametrosSeguimiento(),
+          configuracionApi.motivosCierre(),
+        ]);
+        const warnings: string[] = [];
+
+        const grupos = gs.status === "fulfilled" ? extractConfiguracionItems(gs.value) : [];
+        setGruposApi(
+          grupos
+            .map((x) => ({
+              id: String(x?.id ?? x?.grupoId ?? ""),
+              nombre: String(x?.nombre ?? x?.grupo ?? ""),
+            }))
+            .filter((x: CatalogOption) => x.id.length > 0 && x.nombre.length > 0),
+        );
+        if (gs.status === "rejected") {
+          warnings.push("No se pudo cargar el catálogo de grupos.");
+        }
+
+        const distritos = ds.status === "fulfilled" ? extractConfiguracionItems(ds.value) : [];
+        setDistritosApi(
+          distritos
+            .map((x) => ({
+              id: String(x?.id ?? x?.distritoId ?? ""),
+              nombre: String(x?.nombre ?? x?.distrito ?? ""),
+            }))
+            .filter((x: CatalogOption) => x.id.length > 0 && x.nombre.length > 0),
+        );
+        if (ds.status === "rejected") {
+          warnings.push("No se pudo cargar el catálogo de distritos.");
+        }
+
+        const etapasPayload = es.status === "fulfilled" ? extractConfiguracionItems(es.value) : [];
+        const etapasFromApi = etapasPayload
+          .map((x) => ({
+            id: String(x?.id ?? x?.etapaId ?? ""),
+            nombre: String(x?.nombre ?? x?.etapa ?? ""),
+          }))
+          .filter((x: CatalogOption) => x.id.length > 0 && x.nombre.length > 0);
+        setEtapasApi(etapasFromApi);
+        if (es.status === "rejected") {
+          warnings.push("No se pudo cargar el catálogo de etapas.");
+        } else if (etapasFromApi.length === 0) {
+          warnings.push("No hay etapas configuradas en API para operar seguimiento.");
+        }
+        const params = (ps.status === "fulfilled" ? extractConfiguracionItems(ps.value) : []);
+        if (ps.status === "rejected") {
+          warnings.push("No se pudo cargar la configuración de parámetros de seguimiento.");
+        } else {
+          const umbral = params.find((x) => String(x.codigo ?? "").toUpperCase().includes("CUOTAS"));
+          const valor = Number(umbral?.valor ?? umbral?.value);
+          if (Number.isFinite(valor) && valor > 0) setUmbralCuotas(valor);
+          else warnings.push("No se encontró el umbral moroso en API; se usa valor por defecto solo para UI.");
+        }
+
+        const motivos = (ms.status === "fulfilled" ? extractConfiguracionItems(ms.value) : []);
+        const motivosActivos = motivos
+          .filter((x) => x?.activo !== false)
+          .map((x) => ({
+            codigo: String(x?.codigo ?? x?.id ?? "").trim(),
+            nombre: String(x?.nombre ?? x?.descripcion ?? x?.codigo ?? "").trim(),
+          }))
+          .filter((x) => x.codigo.length > 0 && x.nombre.length > 0);
+        setMotivosCierreApi(motivosActivos);
+        if (ms.status === "rejected") {
+          warnings.push("No se pudo cargar el catálogo de motivos de cierre.");
+        } else if (motivosActivos.length === 0) {
+          warnings.push("No hay motivos de cierre activos en API; la acción de cierre quedará bloqueada.");
+        }
+        setCatalogWarnings(warnings);
+        if (gs.status === "rejected" && ds.status === "rejected" && es.status === "rejected" && ps.status === "rejected" && ms.status === "rejected") {
+          setCatalogError("No se pudieron cargar catálogos de seguimiento.");
+        }
+      } catch (e) {
+        setCatalogError("No se pudieron cargar catálogos de seguimiento.");
+        toast({ title: "Error de catálogos", description: e instanceof ApiError ? e.message : "No se pudieron cargar catálogos.", variant: "destructive" });
+      } finally {
+        setCatalogLoading(false);
+      }
+    };
+    loadCatalogs();
+  }, [toast]);
+
+  const fetchBandeja = useCallback(async () => {
+    if (!USE_API) {
+      setLoading(false);
+      setError("Funcionalidad pendiente de integración.");
+      setRows([]);
+      setTotalElements(0);
+      setTotalPages(1);
+      return;
+    }
+    try {
+      setLoading(true);
+      setError(null);
+      const normalizeFilterParams = (params: Record<string, string | number | undefined>) =>
+        Object.fromEntries(
+          Object.entries(params).filter(([_, value]) => {
+            if (value === undefined || value === null || value === "") return false;
+            if (typeof value === "string" && ["todos", "todas", "all"].includes(value.toLowerCase())) return false;
+            return true;
+          }),
+        );
+
+      const sortFieldMap: Record<SortKey, string> = {
+        cuenta: "cuenta",
+        titular: "titular",
+        direccion: "direccion",
+        grupo: "grupoNombre",
+        distrito: "distritoNombre",
+        cuotas: "cuotasAdeudadas",
+        montoAdeudado: "montoAdeudado",
+        etapaActual: "etapaActualNombre",
+        fechaProgramada: "fechaProgramada",
+        estado: "estado",
+      };
+
+      const res = await seguimientoApi.getBandeja(normalizeFilterParams({
+        query: query.trim() || undefined,
+        grupoId: grupo === "all" ? undefined : grupo,
+        distritoId: distrito === "all" ? undefined : distrito,
+        etapaId: etapaFiltro === "all" || etapaFiltro === "sin-etapa" ? undefined : etapaFiltro,
+        estado: estadoFiltro === "all" ? undefined : estadoFiltro,
+        cuotasMin: cuotasMin ? Number(cuotasMin) : undefined,
+        page: page - 1,
+        size: PAGE_SIZE,
+        sort: `${sortFieldMap[sortKey]},${sortDir}`,
+      }));
+      const pageData = "number" in res ? normalizeSpringPage(res) : normalizePageResponse(res);
+      setRows((pageData.content || []).map(mapSeguimientoBandejaRow));
+      setTotalElements(pageData.totalElements);
+      setTotalPages(Math.max(1, pageData.totalPages));
+    } catch (e) {
+      setError("No se pudo cargar la bandeja de seguimiento");
+    } finally {
+      setLoading(false);
+    }
+  }, [query, grupo, distrito, etapaFiltro, estadoFiltro, cuotasMin, page, sortKey, sortDir]);
+
+  useEffect(() => {
+    void fetchBandeja();
+  }, [fetchBandeja]);
+
+
+  const toggleSort = (key: SortKey) => {
+    if (sortKey === key) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    else {
+      setSortKey(key);
+      setSortDir("asc");
+    }
+    setPage(1);
+  };
+
+  const filtered = rows;
+
+  const safePage = Math.min(page, totalPages);
+  const pageStart = (safePage - 1) * PAGE_SIZE;
+  const pageRows = filtered;
+
+  const pageIds = pageRows.map((r) => r.id);
+  const allPageSelected = pageIds.length > 0 && pageIds.every((id) => selected.has(id));
+  const somePageSelected = pageIds.some((id) => selected.has(id));
+
+  const togglePageSelection = () => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (allPageSelected) {
+        pageIds.forEach((id) => next.delete(id));
+      } else {
+        pageIds.forEach((id) => next.add(id));
+      }
+      return next;
+    });
+  };
+
+  const toggleOne = (id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const clearSelection = () => setSelected(new Set());
+
+  const seleccionados = useMemo(
+    () => rows.filter((m) => selected.has(m.id)),
+    [rows, selected],
+  );
+  const selectedActions = useMemo(() => {
+    const selectedRows = rows.filter((m) => selected.has(m.id));
+    const hasAny = selectedRows.length > 0;
+    const missingBackendActions = USE_API && selectedRows.some((m) => !m.accionesDisponibles);
+    const hasBackendActions = selectedRows.some((m) => !!m.accionesDisponibles);
+    const canAll = (key: keyof NonNullable<AccionesDisponiblesRow>) =>
+      selectedRows.every((m) => (m.accionesDisponibles?.[key] ?? false) === true);
+
+    const blockedNoSelection = "No hay casos seleccionados.";
+    const blockedMissingBackend = "El backend no informó acciones disponibles para algunos casos.";
+    const reasonByApi = (can: boolean) =>
+      !hasAny ? blockedNoSelection : missingBackendActions ? blockedMissingBackend : can ? null : "No hay casos válidos para esta acción.";
+
+    const canIniciar = USE_API ? (hasBackendActions && !missingBackendActions ? canAll("puedeIniciar") : false) : selectedRows.every((m) => m.etapa === null);
+    const canAvanzar = USE_API
+      ? (hasBackendActions && !missingBackendActions && etapasApi.length > 0 ? canAll("puedeAvanzar") : false)
+      : selectedRows.some((m) => m.etapa !== null);
+    const canRepetir = USE_API ? (hasBackendActions && !missingBackendActions ? canAll("puedeRepetir") : false) : selectedRows.some((m) => m.etapa !== null);
+    const canPausar = USE_API ? (hasBackendActions && !missingBackendActions ? canAll("puedePausar") : false) : selectedRows.some((m) => m.etapa !== null);
+    const canCerrar = USE_API ? (hasBackendActions && !missingBackendActions ? canAll("puedeCerrar") : false) : selectedRows.every((m) => m.etapa !== null);
+    const canCompromiso = USE_API ? (hasBackendActions && !missingBackendActions ? canAll("puedeRegistrarCompromiso") : false) : true;
+    const canReanudar = USE_API ? (hasBackendActions && !missingBackendActions ? canAll("puedeReabrir") : false) : selectedRows.every((m) => m.estado === "Pausado");
+    const canObservacionEtapa = hasAny && selectedRows.every((m) => ["Iniciado", "Pausado"].includes(m.estado) && Boolean(m.casoId) && Boolean(m.etapa));
+
+    return {
+      hasAny,
+      canIniciar,
+      canAvanzar,
+      canRepetir,
+      canPausar,
+      canCerrar,
+      canCompromiso,
+      canReanudar,
+      canObservacionEtapa,
+      hasBackendActions,
+      missingBackendActions,
+      reasons: {
+        iniciar: USE_API ? reasonByApi(canIniciar) : (!hasAny ? blockedNoSelection : canIniciar ? null : "No hay casos válidos para esta acción."),
+        avanzar: !hasAny
+          ? blockedNoSelection
+          : USE_API && etapasApi.length === 0
+            ? "No hay etapas activas configuradas."
+            : (USE_API ? reasonByApi(canAvanzar) : (canAvanzar ? null : "No hay casos válidos para esta acción.")),
+        enviarEtapa: !hasAny
+          ? blockedNoSelection
+          : USE_API && etapasApi.length === 0
+            ? "No hay etapas activas configuradas."
+            : (USE_API
+                ? (missingBackendActions
+                    ? blockedMissingBackend
+                    : canAvanzar
+                      ? null
+                      : "Algunos casos seleccionados no pueden avanzar según el backend.")
+                : null),
+        repetir: USE_API
+          ? (!hasAny ? blockedNoSelection : missingBackendActions ? blockedMissingBackend : canRepetir ? null : "No hay procesos iniciados para repetir etapa.")
+          : (!hasAny ? blockedNoSelection : canRepetir ? null : "No hay procesos iniciados para repetir etapa."),
+        pausar: USE_API ? reasonByApi(canPausar) : (!hasAny ? blockedNoSelection : canPausar ? null : "No hay casos válidos para esta acción."),
+        cerrar: !hasAny
+          ? blockedNoSelection
+          : USE_API && motivosCierreApi.length === 0
+            ? "No hay motivos de cierre activos configurados."
+            : (USE_API ? reasonByApi(canCerrar) : (canCerrar ? null : "No hay casos válidos para esta acción.")),
+        reanudar: USE_API ? reasonByApi(canReanudar) : (!hasAny ? blockedNoSelection : canReanudar ? null : "No hay casos válidos para esta acción."),
+        compromiso: USE_API ? reasonByApi(canCompromiso) : (!hasAny ? blockedNoSelection : null),
+        observacionEtapa: !hasAny ? blockedNoSelection : canObservacionEtapa ? null : "Disponible solo para procesos iniciados o pausados con etapa actual.",
+      },
+    };
+  }, [rows, selected, etapasApi, motivosCierreApi]);
+
+  const hasFilters =
+    query !== "" ||
+    etapaFiltro !== "all" ||
+    estadoFiltro !== "all" ||
+    grupo !== "all" ||
+    distrito !== "all" ||
+    cuotasMin !== "";
+
+  const resetFilters = () => {
+    setQuery("");
+    setEtapaFiltro("all");
+    setEstadoFiltro("all");
+    setGrupo("all");
+    setDistrito("all");
+    setCuotasMin("");
+    setPage(1);
+  };
+
+  const abrirDialogoCompromiso = async () => {
+    const selectedRows = rows.filter((r) => selected.has(r.id));
+    const casoId = selectedRows.length === 1 ? selectedRows[0].casoId : null;
+    setCompromisoVigente(null);
+    if (!USE_API || !casoId) {
+      setAccion({ kind: "compromiso" });
+      return;
+    }
+    try {
+      setCompromisoDialogLoading(true);
+      const vigente = await seguimientoApi.getCompromisoVigente(casoId);
+      setCompromisoVigente(vigente);
+    } catch (e) {
+      setCompromisoVigente(null);
+    } finally {
+      setCompromisoDialogLoading(false);
+      setAccion({ kind: "compromiso" });
+    }
+  };
+
+  const confirmarAccion = async (data: AccionDialogConfirmPayload) => {
+    const selectedRows = rows.filter((r) => selected.has(r.id));
+    if (!USE_API) {
+      const total = selected.size;
+      toast({ title: "Acción aplicada", description: `${total} inmueble(s) procesado(s) correctamente.` });
+      setAccion(null);
+      clearSelection();
+      return;
+    }
+    try {
+      setMutating(true);
+      let result: SeguimientoResultado = null;
+      if (data.kind === "iniciar") {
+        const inmuebleIds = selectedRows.filter((r) => !r.casoId).map((r) => r.inmuebleId || r.id);
+        result = await seguimientoApi.iniciar({ inmuebleIds, observacion: data.payload.observacion });
+      } else if (data.kind === "enviar-siguiente") {
+        const casoIds = selectedRows.map((r) => r.casoId).filter(Boolean);
+        result = await seguimientoApi.avanzar({ casoIds, observacion: data.payload.observacion });
+      } else if (data.kind === "enviar-etapa") {
+        const casoIds = selectedRows.map((r) => r.casoId).filter(Boolean);
+        const etapaDestinoId = etapaIdByNombre.get(data.payload.etapaDestinoId) ?? data.payload.etapaDestinoId;
+        result = await seguimientoApi.enviarEtapa({
+          casoIds,
+          etapaDestinoId,
+          observacion: data.payload.observacion,
+          repetirMismaEtapa: Boolean(data.payload.repetirMismaEtapa),
+        });
+      } else if (data.kind === "repetir-etapa") {
+        const casoIds = selectedRows.map((r) => r.casoId).filter(Boolean);
+        result = await seguimientoApi.repetir({ casoIds, observacion: data.payload.observacion });
+      } else if (data.kind === "pausar") {
+        const casoIds = selectedRows.map((r) => r.casoId).filter(Boolean);
+        result = await seguimientoApi.pausar({ casoIds, observacion: data.payload.observacion, motivoPausa: data.payload.motivoPausa });
+      } else if (data.kind === "reanudar") {
+        const casoIds = selectedRows.map((r) => r.casoId).filter(Boolean);
+        result = await seguimientoApi.reanudar({ casoIds, observacion: data.payload.observacion });
+      } else if (data.kind === "cerrar") {
+        const casoIds = selectedRows.map((r) => r.casoId).filter(Boolean);
+        result = await seguimientoApi.cerrarBulk({
+          casoSeguimientoIds: casoIds,
+          ...data.payload,
+        });
+      } else if (data.kind === "compromiso") {
+        if (data.payload.compromisoId && selectedRows.length === 1) {
+          result = await seguimientoApi.actualizarCompromiso(data.payload.compromisoId, data.payload);
+        } else {
+          const casoIds = selectedRows.map((r) => r.casoId).filter(Boolean);
+          result = await seguimientoApi.registrarCompromisosBulk({
+            casoSeguimientoIds: casoIds,
+            ...data.payload,
+          });
+        }
+      } else if (data.kind === "observacion-etapa") {
+        const casoIds = selectedRows.map((r) => r.casoId).filter(Boolean);
+        await Promise.all(casoIds.map((casoSeguimientoId) => seguimientoApi.agregarObservacionEtapa({
+          casoSeguimientoId,
+          observacion: data.payload.observacion,
+        })));
+        result = { aplicados: casoIds.length, omitidos: 0, errores: 0 };
+      }
+      const aplicados = Number(result?.aplicados ?? result?.applied ?? selectedRows.length);
+      const omitidos = Number(result?.omitidos ?? result?.skipped ?? 0);
+      const errores = Number(result?.errores ?? result?.errors ?? 0);
+      toast({ title: "Acción ejecutada", description: `Aplicados: ${aplicados} · Omitidos: ${omitidos} · Errores: ${errores}` });
+      await fetchBandeja();
+      setAccion(null);
+      clearSelection();
+      if (errores > 0) {
+        const primerError = Array.isArray(result?.resultados)
+          ? result.resultados.find((r) => String(r?.estado ?? "").toUpperCase() === "ERROR")
+          : null;
+        const detalle = primerError?.mensaje
+          ? `Primer error: ${primerError.mensaje}`
+          : "Algunos casos no pudieron procesarse.";
+        toast({
+          title: "Ejecución parcial",
+          description: `${detalle} Revisá el backend e intentá nuevamente.`,
+          variant: "destructive",
+        });
+      }
+    } catch (e) {
+      toast({ title: "Error", description: e instanceof ApiError ? e.message : "No se pudo ejecutar la acción.", variant: "destructive" });
+    } finally {
+      setMutating(false);
+    }
+  };
+
+  return (
+    <>
+      <AppHeader
+        title="Gestión de etapas"
+        description="Vista operativa para mover inmuebles dentro del proceso de seguimiento. Las etapas son configurables, el paso es manual y no admite retroceso."
+        breadcrumb={[{ label: "Gestión de etapas" }]}
+      />
+
+      <main className="min-w-0 flex-1 px-3 py-4 sm:px-4 sm:py-4">
+        {catalogLoading && <div className="mb-2 text-xs text-muted-foreground">Cargando catálogos de seguimiento...</div>}
+        {catalogError && <div className="mb-2 text-xs text-destructive">{catalogError}</div>}
+        {!catalogError && catalogWarnings.length > 0 && (
+          <div className="mb-2 text-xs text-amber-700">
+            {catalogWarnings.map((w, idx) => <div key={`${idx}-${w}`}>{w}</div>)}
+          </div>
+        )}
+        {/* Aviso de universo: solo entran inmuebles que cumplen el umbral configurado */}
+        <div className="mb-3 flex flex-wrap items-start gap-3 rounded-md border border-primary/20 bg-primary-soft/40 px-3 py-2.5 text-[12.5px] text-foreground">
+          <Settings2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
+          <div className="flex-1 leading-5">
+            Esta vista solo incluye inmuebles con{" "}
+            <span className="font-semibold">{umbralCuotas} o más cuotas adeudadas</span>,
+            según el umbral configurado para considerar moroso.
+            {excluidosPorUmbral > 0 && (
+              <>
+                {" "}
+                <span className="text-muted-foreground">
+                  ({numberFmt.format(excluidosPorUmbral)} inmuebles del padrón quedan
+                  fuera del seguimiento por no alcanzar ese mínimo.)
+                </span>
+              </>
+            )}
+          </div>
+          <Link
+            to="/configuracion/seguimiento"
+            className="shrink-0 text-[12px] font-medium text-primary underline-offset-2 hover:underline"
+          >
+            Configurar umbral
+          </Link>
+        </div>
+
+        <div className="rounded-md border border-border bg-surface shadow-sm">
+          {/* Barra de filtros */}
+          <div className="flex flex-col gap-2 border-b border-border px-3 py-2.5 sm:flex-row sm:flex-wrap sm:items-center">
+            <div className="flex items-center gap-1.5 pr-1 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+              <Filter className="h-3.5 w-3.5" />
+              Filtros
+            </div>
+
+            <div className="relative min-w-0 flex-1 sm:min-w-[220px] sm:max-w-[280px]">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={query}
+                onChange={(e) => {
+                  setQuery(e.target.value);
+                  setPage(1);
+                }}
+                placeholder="Cuenta, titular o dirección..."
+                className="h-8 pl-8 text-[12.5px]"
+              />
+            </div>
+
+            <div className="mx-1 hidden h-5 w-px bg-border sm:block" />
+
+            <Select
+              value={etapaFiltro}
+              onValueChange={(v) => {
+                setEtapaFiltro(v as EtapaFiltro);
+                setPage(1);
+              }}
+            >
+              <SelectTrigger className="h-8 w-full text-[12.5px] sm:w-[180px]" disabled={USE_API && (catalogError !== null || etapasApi.length === 0)}>
+                <SelectValue placeholder="Etapa actual" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all" className="text-[13px]">Todas las etapas</SelectItem>
+                <SelectItem value="sin-etapa" className="text-[13px]">Sin etapa asignada</SelectItem>
+                {etapasApi.map((e) => (
+                  <SelectItem key={e.id} value={e.id} className="text-[13px]">{e.nombre}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+
+            <Select
+              value={estadoFiltro}
+              onValueChange={(v) => {
+                setEstadoFiltro(v as EstadoFiltro);
+                setPage(1);
+              }}
+            >
+              <SelectTrigger className="h-8 w-full text-[12.5px] sm:w-[160px]">
+                <SelectValue placeholder="Estado" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all" className="text-[13px]">Todos los estados</SelectItem>
+                {([
+                  { label: "Iniciado", value: "ABIERTO" },
+                  { label: "Pausado", value: "PAUSADO" },
+                  { label: "Cerrado", value: "CERRADO" },
+                ] as const).map((e) => (
+                  <SelectItem key={e.value} value={e.value} className="text-[13px]">{e.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+
+            <div className="mx-1 hidden h-5 w-px bg-border sm:block" />
+
+            <Select value={grupo} onValueChange={(v) => { setGrupo(v); setPage(1); }}>
+              <SelectTrigger className="h-8 w-full text-[12.5px] sm:w-[140px]" disabled={USE_API && (catalogError !== null || gruposApi.length === 0)}>
+                <SelectValue placeholder="Grupo" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all" className="text-[13px]">Todos los grupos</SelectItem>
+                {gruposApi.map((g) => (
+                  <SelectItem key={g.id} value={g.id} className="text-[13px]">{g.nombre}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+
+            <Select value={distrito} onValueChange={(v) => { setDistrito(v); setPage(1); }}>
+              <SelectTrigger className="h-8 w-full text-[12.5px] sm:w-[140px]" disabled={USE_API && (catalogError !== null || distritosApi.length === 0)}>
+                <SelectValue placeholder="Distrito" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all" className="text-[13px]">Todos los distritos</SelectItem>
+                {distritosApi.map((d) => (
+                  <SelectItem key={d.id} value={d.id} className="text-[13px]">{d.nombre}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+
+            <div className="relative w-full sm:w-[130px]">
+              <Input
+                type="number"
+                inputMode="numeric"
+                min={umbralCuotas}
+                value={cuotasMin}
+                onChange={(e) => {
+                  setCuotasMin(e.target.value);
+                  setPage(1);
+                }}
+                placeholder={`Cuotas ≥ ${umbralCuotas}`}
+                className="h-8 text-[12.5px] tabular"
+                title={`El umbral mínimo del sistema es ${umbralCuotas} cuotas.`}
+              />
+            </div>
+
+            {hasFilters && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={resetFilters}
+                className="ml-auto h-8 px-2 text-[12px] text-muted-foreground hover:text-foreground"
+              >
+                Limpiar filtros
+              </Button>
+            )}
+          </div>
+
+          {/* Resumen / barra de selección */}
+          {selected.size === 0 ? (
+            <div className="flex flex-wrap items-center gap-x-6 gap-y-1 border-b border-border bg-surface-muted/40 px-3 py-2 text-[12px] text-muted-foreground">
+              <div>
+                <span className="tabular font-semibold text-foreground">{numberFmt.format(filtered.length)}</span>{" "}
+                inmuebles
+              </div>
+              <div>
+                Sin etapa:{" "}
+                <span className="tabular font-semibold text-foreground">
+                  {numberFmt.format(filtered.filter((m) => m.etapa === null).length)}
+                </span>
+              </div>
+              <div>
+                Iniciados:{" "}
+                <span className="tabular font-semibold text-foreground">
+                  {numberFmt.format(filtered.filter((m) => m.estado === "Iniciado").length)}
+                </span>
+              </div>
+              <div>
+                Pausados:{" "}
+                <span className="tabular font-semibold text-foreground">
+                  {numberFmt.format(filtered.filter((m) => m.estado === "Pausado").length)}
+                </span>
+              </div>
+              <div className="ml-auto hidden items-center gap-1.5 text-[11px] sm:flex">
+                <AlertTriangle className="h-3.5 w-3.5 text-amber-600" />
+                Las etapas avanzan en forma manual y no pueden retroceder.
+              </div>
+            </div>
+          ) : (
+            <SelectionBar
+              count={selected.size}
+              hasSinEtapa={seleccionados.some((m) => m.etapa === null)}
+              hasConEtapa={seleccionados.some((m) => m.etapa !== null)}
+              hasPausado={seleccionados.some((m) => m.estado === "Pausado")}
+              etapasOperativas={etapasOperativas}
+              selectedActions={selectedActions}
+              onClear={clearSelection}
+              onAction={(a) => { if (a.kind === "compromiso") { void abrirDialogoCompromiso(); return; } setAccion(a); }}
+            />
+          )}
+
+          {/* Tabla */}
+          <div className="space-y-3 p-3 md:hidden">
+            {pageRows.length === 0 && (
+              <div className="rounded-md border border-dashed border-border px-4 py-8 text-center text-[13px] text-muted-foreground">
+                {loading ? "Cargando bandeja..." : error ?? "No se encontraron inmuebles con los filtros aplicados."}
+              </div>
+            )}
+            {pageRows.map((m) => (
+              <InmuebleCard
+                key={m.id}
+                m={m}
+                checked={selected.has(m.id)}
+                onToggle={() => toggleOne(m.id)}
+              />
+            ))}
+          </div>
+          <div className="hidden max-h-[70vh] overflow-auto md:block" role="region" aria-label="Inmuebles por etapa" tabIndex={0}>
+            <table className="w-full min-w-[980px] table-fixed caption-bottom text-sm [&_td]:px-3 [&_td]:py-3.5 [&_th]:px-3 [&_thead]:sticky [&_thead]:top-0 [&_thead]:z-10 [&_thead]:bg-surface">
+              <colgroup><col style={{width:40}}/><col style={{width:140}}/><col/><col style={{width:150}}/><col style={{width:130}}/><col style={{width:150}}/><col style={{width:140}}/></colgroup>
+              <TableHeader>
+                <TableRow className="border-border bg-surface-muted/60 hover:bg-surface-muted/60">
+                  <TableHead className="h-9 w-[44px] pl-4">
+                    <Checkbox
+                      checked={allPageSelected ? true : somePageSelected ? "indeterminate" : false}
+                      onCheckedChange={togglePageSelection}
+                      aria-label="Seleccionar página"
+                    />
+                  </TableHead>
+                  <SortableHead label="Cuenta" k="cuenta" sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} />
+                  <SortableHead label="Titular" k="titular" secondary={{label:"Dirección",k:"direccion"}} sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} />
+                  <SortableHead label="Grupo" k="grupo" secondary={{label:"Distrito",k:"distrito"}} sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} />
+                  <SortableHead label="Deuda" k="montoAdeudado" secondary={{label:"Cuotas",k:"cuotas"}} sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} className="text-right" />
+                  <SortableHead label="Etapa" k="etapaActual" secondary={{label:"Estado",k:"estado"}} sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} />
+                  <SortableHead label="Programada" k="fechaProgramada" sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} />
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {pageRows.length === 0 && (
+                  <TableRow>
+                    <TableCell colSpan={7} className="h-32 text-center text-[13px] text-muted-foreground">
+                      {loading ? "Cargando bandeja..." : error ?? "No se encontraron inmuebles con los filtros aplicados."}
+                    </TableCell>
+                  </TableRow>
+                )}
+                {pageRows.map((m) => (
+                  <InmuebleRow
+                    key={m.id}
+                    m={m}
+                    checked={selected.has(m.id)}
+                    onToggle={() => toggleOne(m.id)}
+                  />
+                ))}
+              </TableBody>
+            </table>
+          </div>
+
+          {/* Paginación */}
+          <div className="flex flex-col items-center justify-between gap-2 border-t border-border px-3 py-2.5 text-[12px] text-muted-foreground sm:flex-row">
+            <div>
+              Mostrando{" "}
+              <span className="tabular font-medium text-foreground">
+                {totalElements === 0 ? 0 : pageStart + 1}–
+                {Math.min(pageStart + PAGE_SIZE, totalElements)}
+              </span>{" "}
+              de <span className="tabular font-medium text-foreground">{totalElements}</span>
+            </div>
+            <div className="flex items-center gap-1">
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 px-2 text-[12px]"
+                disabled={safePage <= 1}
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+              >
+                Anterior
+              </Button>
+              <span className="px-2 tabular">
+                {safePage} / {totalPages}
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 px-2 text-[12px]"
+                disabled={safePage >= totalPages}
+                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              >
+                Siguiente
+              </Button>
+            </div>
+          </div>
+        </div>
+      </main>
+
+      <AccionDialog
+        accion={accion}
+        seleccionados={seleccionados}
+        etapasOperativas={etapasOperativas}
+        motivosCierre={motivosCierreApi}
+        selectedActions={selectedActions}
+        onCancel={() => { setAccion(null); setCompromisoVigente(null); }}
+        onConfirm={confirmarAccion}
+        mutating={mutating}
+        compromisoVigente={compromisoVigente}
+        compromisoLoading={compromisoDialogLoading}
+      />
+    </>
+  );
+}
+
+/* -------- Fila de inmueble -------- */
+
+interface SortableHeadProps {
+  label: string;
+  k: SortKey;
+  sortKey: SortKey;
+  sortDir: SortDir;
+  onClick: (k: SortKey) => void;
+  className?: string;
+  secondary?: {label:string;k:SortKey};
+}
+
+function SortableHead({ label, k, secondary, sortKey, sortDir, onClick, className }: SortableHeadProps) {
+  const button = (text:string, key:SortKey, sub=false) => {
+    const active=sortKey===key;
+    const Icon=!active ? ArrowUpDown : sortDir==="asc" ? ArrowUp : ArrowDown;
+    return <button type="button" aria-label={`Ordenar por ${text}`} onClick={()=>onClick(key)} className={cn("inline-flex items-center gap-1 transition-colors hover:text-foreground",sub ? "text-[11px] font-normal" : "text-[11px] font-semibold uppercase tracking-wide",active && "text-foreground")}>
+      {text}<Icon className={cn("h-3 w-3",active ? "opacity-100" : "opacity-40")}/>
+    </button>;
+  };
+  return <TableHead className={cn("h-14 text-muted-foreground",className)}><div className={cn("flex flex-col gap-1",className?.includes("text-right") && "items-end")}>{button(label,k)}{secondary && button(secondary.label,secondary.k,true)}</div></TableHead>;
+}
+
+function parseBackendDate(value?: string | null): Date | null {
+  if (!value) return null;
+  const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (dateOnly) {
+    return new Date(Number(dateOnly[1]), Number(dateOnly[2]) - 1, Number(dateOnly[3]));
+  }
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function InmuebleRow({
+  m,
+  checked,
+  onToggle,
+}: {
+  m: InmuebleMoroso;
+  checked: boolean;
+  onToggle: () => void;
+}) {
+  const fecha = parseBackendDate(m.fechaProgramada);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const vencida = fecha ? fecha.getTime() < today.getTime() : false;
+  const hoy = fecha ? fecha.getTime() === today.getTime() : false;
+
+  return (
+    <TableRow
+      className={cn(
+        "border-border bg-surface text-[13px]",
+        checked && "bg-primary-soft/40 hover:bg-primary-soft/50",
+      )}
+    >
+      <TableCell className="pl-4">
+        <Checkbox checked={checked} onCheckedChange={onToggle} aria-label={`Seleccionar ${m.cuenta}`} />
+      </TableCell>
+      <TableCell className="whitespace-nowrap font-mono text-[12.5px] text-foreground">{m.cuenta}</TableCell>
+      <TableCell><div className="font-medium leading-5 text-foreground">{m.titular}</div><div className="mt-1 line-clamp-2 text-xs leading-5 text-muted-foreground" title={m.direccion}>{m.direccion}</div></TableCell>
+      <TableCell><div className="text-foreground">{m.grupo}</div><div className="mt-1 text-xs leading-5 text-muted-foreground">{m.distrito}</div></TableCell>
+      <TableCell className="text-right tabular"><div className="whitespace-nowrap font-medium text-foreground">{moneyFmt.format(m.montoAdeudado)}</div><div className="mt-1 text-xs text-muted-foreground">{numberFmt.format(m.cuotasAdeudadas)} cuotas</div></TableCell>
+      <TableCell><div className="space-y-2"><EtapaPill etapa={m.etapa} /><div><EstadoPill estado={m.estado} /></div></div></TableCell>
+      <TableCell>
+        {fecha ? (
+          <div
+            className={cn(
+              "inline-flex items-center gap-1.5 text-[12.5px] tabular",
+              vencida && "text-destructive",
+              hoy && "font-medium text-amber-700 dark:text-amber-400",
+              !vencida && !hoy && "text-muted-foreground",
+            )}
+          >
+            <CalendarClock className="h-3.5 w-3.5 opacity-80" />
+            {dateFmt.format(fecha)}
+          </div>
+        ) : (
+          <span className="text-[12px] italic text-muted-foreground">—</span>
+        )}
+      </TableCell>
+    </TableRow>
+  );
+}
+
+function InmuebleCard({
+  m,
+  checked,
+  onToggle,
+}: {
+  m: InmuebleMoroso;
+  checked: boolean;
+  onToggle: () => void;
+}) {
+  const fecha = parseBackendDate(m.fechaProgramada);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const vencida = fecha ? fecha.getTime() < today.getTime() : false;
+  const hoy = fecha ? fecha.getTime() === today.getTime() : false;
+
+  return (
+    <article
+      className={cn(
+        "rounded-md border border-border bg-background p-3 shadow-sm",
+        checked && "border-primary/40 bg-primary-soft/30",
+      )}
+    >
+      <div className="flex items-start gap-3">
+        <Checkbox checked={checked} onCheckedChange={onToggle} aria-label={`Seleccionar ${m.cuenta}`} />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="font-mono text-[12px] font-semibold text-foreground">{m.cuenta}</div>
+              <div className="mt-1 text-[13px] font-medium text-foreground">{m.titular}</div>
+              <div className="mt-1 text-[12px] text-muted-foreground">{m.direccion}</div>
+            </div>
+            <EstadoPill estado={m.estado} />
+          </div>
+
+          <div className="mt-3 grid grid-cols-2 gap-2 text-[12px]">
+            <div className="rounded-md bg-surface-muted/50 px-2.5 py-2">
+              <div className="text-muted-foreground">Grupo</div>
+              <div className="font-medium text-foreground">{m.grupo}</div>
+            </div>
+            <div className="rounded-md bg-surface-muted/50 px-2.5 py-2">
+              <div className="text-muted-foreground">Distrito</div>
+              <div className="font-medium text-foreground">{m.distrito}</div>
+            </div>
+            <div className="rounded-md bg-surface-muted/50 px-2.5 py-2">
+              <div className="text-muted-foreground">Cuotas</div>
+              <div className="font-medium tabular text-foreground">{numberFmt.format(m.cuotasAdeudadas)}</div>
+            </div>
+            <div className="rounded-md bg-surface-muted/50 px-2.5 py-2">
+              <div className="text-muted-foreground">Monto</div>
+              <div className="font-medium tabular text-foreground">{moneyFmt.format(m.montoAdeudado)}</div>
+            </div>
+          </div>
+
+          <div className="mt-3 space-y-2">
+            <div>
+              <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                Etapa actual
+              </div>
+              <EtapaPill etapa={m.etapa} />
+            </div>
+            <div className="text-[12px]">
+              {fecha ? (
+                <div
+                  className={cn(
+                    "inline-flex items-center gap-1.5 tabular",
+                    vencida && "text-destructive",
+                    hoy && "font-medium text-amber-700 dark:text-amber-400",
+                    !vencida && !hoy && "text-muted-foreground",
+                  )}
+                >
+                  <CalendarClock className="h-3.5 w-3.5 opacity-80" />
+                  {dateFmt.format(fecha)}
+                </div>
+              ) : (
+                <span className="italic text-muted-foreground">â€”</span>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    </article>
+  );
+}
+
+/* -------- Barra de selección con acciones masivas -------- */
+
+function SelectionBar({
+  count,
+  hasSinEtapa,
+  hasConEtapa,
+  hasPausado,
+  etapasOperativas,
+  selectedActions,
+  onClear,
+  onAction,
+}: {
+  count: number;
+  hasSinEtapa: boolean;
+  hasConEtapa: boolean;
+  hasPausado: boolean;
+  etapasOperativas: EtapaSeguimiento[];
+  selectedActions: {
+    hasAny: boolean;
+    canIniciar: boolean;
+    canAvanzar: boolean;
+    canRepetir: boolean;
+    canPausar: boolean;
+    canCerrar: boolean;
+    canCompromiso: boolean;
+    canReanudar: boolean;
+    canObservacionEtapa: boolean;
+    hasBackendActions: boolean;
+    missingBackendActions: boolean;
+    reasons: Record<string, string | null>;
+  };
+  onClear: () => void;
+  onAction: (a: AccionMasiva) => void;
+}) {
+  const actionReason = (key: string) => selectedActions.reasons[key] ?? undefined;
+  return (
+    <div className="flex flex-wrap items-center gap-2 border-b border-primary/20 bg-primary-soft/60 px-3 py-2 text-[12.5px]">
+      <div className="flex items-center gap-2 pr-1">
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7 text-muted-foreground hover:text-foreground"
+          onClick={onClear}
+          aria-label="Limpiar selección"
+        >
+          <X className="h-4 w-4" />
+        </Button>
+        <span className="font-medium text-foreground">
+          {numberFmt.format(count)} seleccionado{count === 1 ? "" : "s"}
+        </span>
+      </div>
+
+      <div className="mx-1 h-5 w-px bg-border" />
+
+      <Button
+        size="sm"
+        variant="outline"
+        className="h-8 gap-1.5 text-[12.5px]"
+        onClick={() => onAction({ kind: "enviar-etapa", etapa: etapasOperativas[0] ?? "Aviso de deuda" })}
+        disabled={Boolean(actionReason("enviarEtapa"))}
+        title={actionReason("enviarEtapa")}
+      >
+        <ChevronsRight className="h-3.5 w-3.5" />
+        Enviar a etapa
+      </Button>
+
+      <Button
+        size="sm"
+        variant="outline"
+        className="h-8 gap-1.5 text-[12.5px]"
+        onClick={() => onAction({ kind: "enviar-siguiente" })}
+        disabled={!selectedActions.canAvanzar}
+        title={actionReason("avanzar")}
+      >
+        <ArrowRightCircle className="h-3.5 w-3.5" />
+        Etapa siguiente
+      </Button>
+
+      <Button
+        size="sm"
+        variant="outline"
+        className="h-8 gap-1.5 text-[12.5px]"
+        onClick={() => onAction({ kind: "repetir-etapa" })}
+        disabled={USE_API ? !selectedActions.canRepetir : !hasConEtapa}
+        title={USE_API ? actionReason("repetir") : (!hasConEtapa ? "Requiere inmuebles con etapa asignada" : undefined)}
+      >
+        <RotateCcw className="h-3.5 w-3.5" />
+        Repetir etapa
+      </Button>
+
+      <Button
+        size="sm"
+        variant="outline"
+        className="h-8 gap-1.5 text-[12.5px]"
+        onClick={() => onAction({ kind: "pausar" })}
+        disabled={USE_API ? !selectedActions.canPausar : !hasConEtapa}
+        title={USE_API ? actionReason("pausar") : (!hasConEtapa ? "Requiere inmuebles con etapa asignada" : undefined)}
+      >
+        <PauseCircle className="h-3.5 w-3.5" />
+        Pausar proceso
+      </Button>
+
+      {hasSinEtapa && !hasConEtapa && (
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-8 gap-1.5 text-[12.5px]"
+          onClick={() => onAction({ kind: "iniciar" })}
+          disabled={!selectedActions.canIniciar}
+          title={actionReason("iniciar")}
+        >
+          <PlayCircle className="h-3.5 w-3.5" />
+          Iniciar proceso
+        </Button>
+      )}
+
+      {hasConEtapa && !hasSinEtapa && (
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-8 gap-1.5 text-[12.5px]"
+          onClick={() => onAction({ kind: "cerrar" })}
+          disabled={!selectedActions.canCerrar || actionReason("cerrar") !== undefined}
+          title={actionReason("cerrar")}
+        >
+          <StopCircle className="h-3.5 w-3.5" />
+          Cerrar proceso
+        </Button>
+      )}
+      {hasPausado && (
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-8 gap-1.5 text-[12.5px]"
+          onClick={() => onAction({ kind: "reanudar" })}
+          disabled={!selectedActions.canReanudar}
+          title={actionReason("reanudar")}
+        >
+          <PlayCircle className="h-3.5 w-3.5" />
+          Reanudar proceso
+        </Button>
+      )}
+
+      <div className="mx-1 h-5 w-px bg-border" />
+
+      <Button
+        size="sm"
+        variant="outline"
+        className="h-8 gap-1.5 text-[12.5px]"
+        onClick={() => onAction({ kind: "compromiso" })}
+        disabled={!selectedActions.canCompromiso}
+        title={actionReason("compromiso")}
+      >
+        <HandCoins className="h-3.5 w-3.5" />
+        {hasPausado ? "Editar compromiso" : "Compromiso de pago"}
+      </Button>
+
+      <Button
+        size="sm"
+        variant="outline"
+        className="h-8 gap-1.5 text-[12.5px]"
+        onClick={() => onAction({ kind: "observacion-etapa" })}
+        disabled={!selectedActions.canObservacionEtapa}
+        title={actionReason("observacionEtapa")}
+      >
+        <FileText className="h-3.5 w-3.5" />
+        Agregar observación
+      </Button>
+    </div>
+  );
+}
+
+/* -------- Pills de etapa y estado -------- */
+
+function EtapaPill({ etapa }: { etapa: EtapaSeguimiento | null }) {
+  if (!etapa) {
+    return (
+      <span className="inline-flex items-center rounded-md border border-dashed border-border px-2 py-0.5 text-[11.5px] italic text-muted-foreground">
+        Sin etapa
+      </span>
+    );
+  }
+  const cls: Record<EtapaSeguimiento, string> = {
+    "Aviso de deuda": "border-border bg-muted text-foreground",
+    "Intimación": "border-amber-500/20 bg-amber-500/10 text-amber-700 dark:text-amber-400",
+    "Aviso de corte": "border-orange-500/20 bg-orange-500/10 text-orange-700 dark:text-orange-400",
+    "Corte": "border-destructive/20 bg-destructive/10 text-destructive",
+  };
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center rounded-md border px-2 py-0.5 text-[11.5px] font-medium",
+        cls[etapa],
+      )}
+    >
+      {etapa}
+    </span>
+  );
+}
+
+function EstadoPill({ estado }: { estado: EstadoProceso }) {
+  const cls: Record<EstadoProceso, string> = {
+    "No iniciado": "border-border bg-muted text-muted-foreground",
+    Iniciado:
+      "border-emerald-500/20 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400",
+    Pausado:
+      "border-amber-500/20 bg-amber-500/10 text-amber-700 dark:text-amber-400",
+    Cerrado: "border-status-closed/20 bg-status-closed-soft text-status-closed",
+  };
+  const dot: Record<EstadoProceso, string> = {
+    "No iniciado": "bg-muted-foreground/60",
+    Iniciado: "bg-emerald-500",
+    Pausado: "bg-amber-500",
+    Cerrado: "bg-status-closed",
+  };
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1.5 rounded-md border px-2 py-0.5 text-[11.5px] font-medium",
+        cls[estado],
+      )}
+    >
+      <span aria-hidden className={cn("h-1.5 w-1.5 rounded-full", dot[estado])} />
+      {estado}
+    </span>
+  );
+}
+
+/* -------- Diálogo de confirmación de acción masiva -------- */
+
+function AccionDialog({
+  accion,
+  seleccionados,
+  etapasOperativas,
+  motivosCierre,
+  selectedActions,
+  onCancel,
+  onConfirm,
+  mutating = false,
+  compromisoVigente = null,
+  compromisoLoading = false,
+}: {
+  accion: AccionMasiva | null;
+  seleccionados: InmuebleMoroso[];
+  etapasOperativas: EtapaSeguimiento[];
+  motivosCierre: MotivoCierreOption[] | null;
+  selectedActions?: {
+    canAvanzar: boolean;
+    reasons: Record<string, string | null>;
+  };
+  onCancel: () => void;
+  onConfirm: (data: AccionDialogConfirmPayload) => void;
+  mutating?: boolean;
+  compromisoVigente?: CompromisoVigente | null;
+  compromisoLoading?: boolean;
+}) {
+  const open = accion !== null;
+
+  // Modal dedicado e institucional para mover a una etapa.
+  if (accion && accion.kind === "enviar-etapa") {
+    return (
+      <MoverEtapaDialog
+        accion={accion}
+        etapasOperativas={etapasOperativas}
+        seleccionados={seleccionados}
+        selectedActions={selectedActions}
+        onCancel={onCancel}
+        onConfirm={onConfirm}
+        mutating={mutating}
+      />
+    );
+  }
+
+  if (accion && (accion.kind === "enviar-siguiente" || accion.kind === "repetir-etapa")) {
+    return (
+        <ConfirmarEtapaDialog
+          accion={accion}
+          etapasOperativas={etapasOperativas}
+          seleccionados={seleccionados}
+        onCancel={onCancel}
+        onConfirm={onConfirm}
+        mutating={mutating}
+      />
+    );
+  }
+  if (accion && accion.kind === "pausar") {
+    return <PausarProcesoDialog onCancel={onCancel} onConfirm={onConfirm} mutating={mutating} />;
+  }
+
+  // Modal dedicado e institucional para compromiso de pago.
+  if (accion && accion.kind === "compromiso") {
+    return (
+      <CompromisoPagoDialog
+        seleccionados={seleccionados}
+        onCancel={onCancel}
+        onConfirm={onConfirm}
+        mutating={mutating}
+        compromisoVigente={compromisoVigente}
+        compromisoLoading={compromisoLoading}
+      />
+    );
+  }
+  if (accion && accion.kind === "observacion-etapa") {
+    return (
+      <ObservacionEtapaDialog
+        seleccionados={seleccionados}
+        onCancel={onCancel}
+        onConfirm={onConfirm}
+        mutating={mutating}
+      />
+    );
+  }
+
+  // Modal dedicado e institucional para cerrar proceso (con motivo dinámico).
+  if (accion && accion.kind === "cerrar") {
+    return (
+      <CerrarProcesoDialog
+        seleccionados={seleccionados}
+        motivosCierre={motivosCierre}
+        onCancel={onCancel}
+        onConfirm={onConfirm}
+        mutating={mutating}
+      />
+    );
+  }
+
+  const total = seleccionados.length;
+
+  const info = accionInfo(accion);
+
+  // Validaciones contextuales
+  const warning: string | null = null;
+
+  return (
+    <Dialog open={open} onOpenChange={(o) => !o && onCancel()}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle className="font-serif text-xl">{info.titulo}</DialogTitle>
+          <DialogDescription className="text-[13px]">
+            {info.descripcion} Se aplicará a{" "}
+            <span className="font-semibold text-foreground">{numberFmt.format(total)}</span>{" "}
+            inmueble{total === 1 ? "" : "s"} seleccionado{total === 1 ? "" : "s"}.
+          </DialogDescription>
+        </DialogHeader>
+
+        {warning && (
+          <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[12.5px] text-amber-800 dark:text-amber-300">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+            <span>{warning}</span>
+          </div>
+        )}
+
+        {seleccionados.length > 0 && (
+          <div className="max-h-32 overflow-y-auto rounded-md border border-border bg-surface-muted/40 px-3 py-2 text-[12px]">
+            <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+              Resumen
+            </div>
+            <div className="text-muted-foreground">
+              Deuda total involucrada:{" "}
+              <span className="font-semibold text-foreground">
+                {moneyFmt.format(seleccionados.reduce((s, m) => s + m.montoAdeudado, 0))}
+              </span>
+            </div>
+          </div>
+        )}
+
+        <DialogFooter>
+          <Button variant="outline" onClick={onCancel}>
+            Cancelar
+          </Button>
+          <Button
+            onClick={() => {
+              if (accion && (accion.kind === "iniciar" || accion.kind === "enviar-siguiente" || accion.kind === "repetir-etapa" || accion.kind === "reanudar")) {
+                onConfirm({ kind: accion.kind, payload: {} });
+              }
+            }}
+          >
+            Confirmar
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function ObservacionEtapaDialog({
+  seleccionados,
+  onCancel,
+  onConfirm,
+  mutating = false,
+}: {
+  seleccionados: InmuebleMoroso[];
+  onCancel: () => void;
+  onConfirm: (data: AccionDialogConfirmPayload) => void;
+  mutating?: boolean;
+}) {
+  const [observacion, setObservacion] = useState("");
+  const selected = seleccionados[0];
+  return (
+    <Dialog open onOpenChange={(o) => !o && onCancel()}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Agregar observación a etapa</DialogTitle>
+          <DialogDescription>La observación se registrará como evento interno de la etapa actual.</DialogDescription>
+        </DialogHeader>
+        <div className="space-y-4">
+          {seleccionados.length === 1 && (
+            <div className="rounded-md border border-border bg-surface-muted/40 px-3 py-2 text-[12.5px]">
+              <div><span className="font-medium">Cuenta:</span> {selected.cuenta}</div>
+              <div><span className="font-medium">Titular:</span> {selected.titular}</div>
+              <div><span className="font-medium">Etapa actual:</span> {selected.etapa ?? "Sin etapa asignada"}</div>
+            </div>
+          )}
+          <ObservacionField value={observacion} onChange={setObservacion} required />
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onCancel}>Cancelar</Button>
+          <Button disabled={mutating || observacion.trim().length === 0} onClick={() => onConfirm({ kind: "observacion-etapa", payload: { observacion: observacion.trim() } })}>
+            Guardar observación
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function ConfirmarEtapaDialog({
+  accion,
+  etapasOperativas,
+  seleccionados,
+  onCancel,
+  onConfirm,
+  mutating = false,
+  compromisoVigente = null,
+  compromisoLoading = false,
+}: {
+  accion: Extract<AccionMasiva, { kind: "enviar-siguiente" | "repetir-etapa" }>;
+  etapasOperativas: EtapaSeguimiento[];
+  seleccionados: InmuebleMoroso[];
+  onCancel: () => void;
+  onConfirm: (data: AccionDialogConfirmPayload) => void;
+  mutating?: boolean;
+  compromisoVigente?: CompromisoVigente | null;
+  compromisoLoading?: boolean;
+}) {
+  const total = seleccionados.length;
+  const isSiguiente = accion.kind === "enviar-siguiente";
+  const [fecha, setFecha] = useState<Date | undefined>(() => {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d;
+  });
+  const [observacion, setObservacion] = useState("");
+  const [montoComprometido, setMontoComprometido] = useState("");
+  const [calOpen, setCalOpen] = useState(false);
+
+  const avanzados = isSiguiente
+    ? seleccionados.filter((m) => m.etapa !== null && etapaSiguienteEnLista(m.etapa, etapasOperativas) !== null).length
+    : 0;
+  const iniciados = isSiguiente ? seleccionados.filter((m) => m.etapa === null).length : 0;
+  const repetidos = !isSiguiente ? seleccionados.filter((m) => m.etapa !== null).length : 0;
+  const omitidos = isSiguiente
+    ? seleccionados.filter((m) => m.etapa !== null && etapaSiguienteEnLista(m.etapa, etapasOperativas) === null).length
+    : total - repetidos;
+  const aplicables = isSiguiente ? avanzados + iniciados : repetidos;
+  const casosConSeguimiento = seleccionados.filter((m) => !!m.casoId).length;
+  const sinSeguimiento = total - casosConSeguimiento;
+  const canConfirmApi = isSiguiente
+    ? total > 0 && !mutating && (casosConSeguimiento > 0 || sinSeguimiento > 0)
+    : casosConSeguimiento > 0 && !mutating;
+  const canConfirm = USE_API ? canConfirmApi : aplicables > 0 && !mutating;
+  const mensajeApi = !USE_API
+    ? null
+    : (!isSiguiente && casosConSeguimiento === 0)
+      ? "No hay procesos iniciados para repetir etapa."
+      : null;
+  const Icon = isSiguiente ? ArrowRightCircle : RotateCcw;
+
+  const handleConfirm = () => {
+    const partes: string[] = [];
+    if (isSiguiente) {
+      if (avanzados) partes.push(`${avanzados} avanzaron a su siguiente etapa`);
+      if (iniciados) partes.push(`${iniciados} iniciaron en "${etapasOperativas[0] ?? "primera etapa configurada"}"`);
+      if (omitidos) partes.push(`${omitidos} ya estaban en la última etapa y fueron omitidos`);
+      onConfirm({ kind: "enviar-siguiente", payload: { observacion: observacion.trim() || undefined } });
+      return;
+    }
+    if (repetidos) partes.push(`${repetidos} re-emitieron su etapa actual`);
+    if (omitidos) partes.push(`${omitidos} sin etapa fueron omitidos`);
+    onConfirm({ kind: "repetir-etapa", payload: { observacion: observacion.trim() || undefined } });
+  };
+
+  return (
+    <Dialog open onOpenChange={(o) => !o && onCancel()}>
+      <DialogContent className="grid-rows-[auto_minmax(0,1fr)_auto] gap-0 overflow-hidden p-0 sm:max-w-xl">
+        <DialogHeader className="space-y-1 border-b border-border bg-surface-muted/40 px-4 py-4 text-left sm:px-6">
+          <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+            <Icon className="h-3.5 w-3.5" />
+            Gestión de etapas
+          </div>
+          <DialogTitle className="font-serif text-xl leading-tight">
+            {isSiguiente ? "Enviar a etapa siguiente" : "Repetir etapa actual"}
+          </DialogTitle>
+          <DialogDescription className="text-[12.5px]">
+            {isSiguiente
+              ? "Cada inmueble avanzará a su próxima etapa disponible dentro del proceso."
+              : "Se re-emitirá la etapa actual para los inmuebles que ya tienen una etapa asignada."}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-5 overflow-y-auto px-4 py-4 sm:px-6 sm:py-5">
+          {compromisoLoading && <div className="text-sm text-muted-foreground">Cargando compromiso vigente...</div>}
+          <div className="flex items-center justify-between rounded-md border border-border bg-surface-muted/40 px-3 py-2.5">
+            <div className="flex items-center gap-2.5">
+              <div className="flex h-8 w-8 items-center justify-center rounded-md bg-primary-soft text-primary">
+                <Building2 className="h-4 w-4" />
+              </div>
+              <div>
+                <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  Inmuebles seleccionados
+                </div>
+                <div className="text-[13px] text-foreground">
+                  Se aplicará la operación al conjunto seleccionado.
+                </div>
+
+              </div>
+            </div>
+            <div className="text-right">
+              <div className="font-serif text-2xl font-semibold tabular leading-none text-foreground">
+                {numberFmt.format(total)}
+              </div>
+              <div className="text-[10.5px] uppercase tracking-wider text-muted-foreground">
+                inmueble{total === 1 ? "" : "s"}
+              </div>
+            </div>
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="rounded-md border border-border bg-surface-muted/30 px-3 py-2.5 text-[12.5px] text-muted-foreground">
+              <div className="text-[11px] font-semibold uppercase tracking-wider">Resumen</div>
+              <div className="mt-1 space-y-1">
+                {isSiguiente ? (
+                  <>
+                    <div><span className="tabular font-semibold text-foreground">{avanzados}</span> avanzan</div>
+                    <div><span className="tabular font-semibold text-foreground">{iniciados}</span> inician seguimiento</div>
+                  </>
+                ) : (
+                  <div><span className="tabular font-semibold text-foreground">{repetidos}</span> repiten etapa</div>
+                )}
+                <div><span className="tabular font-semibold text-foreground">{omitidos}</span> omitidos</div>
+              </div>
+            </div>
+
+            <div className="space-y-1.5">
+              <Label className="text-[12px] font-medium">Fecha programada</Label>
+              <Popover open={calOpen} onOpenChange={setCalOpen}>
+                <PopoverTrigger asChild>
+                  <Button variant="outline" className="h-9 w-full justify-start text-left text-[13px] font-normal">
+                    <CalendarIcon className="mr-2 h-3.5 w-3.5 opacity-70" />
+                    {fecha ? format(fecha, "dd 'de' MMMM yyyy", { locale: es }) : "Sin fecha"}
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent className="w-auto p-0" align="start">
+                  <Calendar
+                    mode="single"
+                    selected={fecha}
+                    onSelect={(d) => {
+                      setFecha(d);
+                      setCalOpen(false);
+                    }}
+                    initialFocus
+                    locale={es}
+                    className={cn("p-3 pointer-events-auto")}
+                  />
+                </PopoverContent>
+              </Popover>
+            </div>
+          </div>
+
+          <div className="space-y-1.5">
+            <div className="flex items-baseline justify-between">
+              <Label className="text-[12px] font-medium">Observación</Label>
+              <span className="text-[11px] text-muted-foreground">Opcional</span>
+            </div>
+            <Textarea
+              value={observacion}
+              onChange={(e) => setObservacion(e.target.value)}
+              placeholder="Detalle interno de la operación"
+              rows={3}
+              maxLength={500}
+              className="resize-none text-[13px]"
+            />
+          </div>
+
+          {omitidos > 0 && (
+            <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[12.5px] text-amber-800 dark:text-amber-300">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>{omitidos} inmueble{omitidos === 1 ? " será omitido" : "s serán omitidos"} por no cumplir las condiciones de esta acción.</span>
+            </div>
+          )}
+          {mensajeApi && (
+            <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-[12.5px] text-destructive">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>{mensajeApi}</span>
+            </div>
+          )}
+        </div>
+
+        <DialogFooter className="flex-col-reverse gap-2 border-t border-border bg-surface-muted/40 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+          <div className="text-[12px] text-muted-foreground">
+            Se aplicará a <span className="tabular font-semibold text-foreground">{numberFmt.format(aplicables)}</span> de {numberFmt.format(total)}
+          </div>
+          <div className="flex items-center gap-2">
+            <Button variant="outline" onClick={onCancel} className="h-9">Cancelar</Button>
+            <Button onClick={handleConfirm} disabled={!canConfirm} className="h-9">
+              Confirmar acción
+            </Button>
+          </div>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function PausarProcesoDialog({
+  onCancel,
+  onConfirm,
+  mutating = false,
+}: {
+  onCancel: () => void;
+  onConfirm: (data: AccionDialogConfirmPayload) => void;
+  mutating?: boolean;
+}) {
+  const [motivoPausa, setMotivoPausa] = useState("");
+  const [observacion, setObservacion] = useState("");
+  const canConfirm = motivoPausa.trim().length > 0 && !mutating;
+
+  return (
+    <Dialog open onOpenChange={(o) => !o && onCancel()}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle className="font-serif text-xl">Pausar proceso</DialogTitle>
+          <DialogDescription className="text-[12.5px]">
+            El proceso quedará pausado en la etapa actual. No se podrán avanzar etapas hasta que se reanude.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-4">
+          <div className="space-y-1.5">
+            <Label className="text-[12px] font-medium">Motivo de pausa <span className="text-destructive">*</span></Label>
+            <Input value={motivoPausa} onChange={(e) => setMotivoPausa(e.target.value)} maxLength={200} placeholder="Motivo de pausa" />
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-[12px] font-medium">Observación</Label>
+            <Textarea value={observacion} onChange={(e) => setObservacion(e.target.value)} rows={3} maxLength={500} placeholder="Observación opcional" />
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onCancel}>Cancelar</Button>
+          <Button
+            disabled={!canConfirm}
+            onClick={() => onConfirm({ kind: "pausar", payload: { motivoPausa: motivoPausa.trim(), observacion: observacion.trim() || undefined } })}
+          >
+            Confirmar pausa
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/* -------- Modal institucional: Cerrar proceso (motivo dinámico) -------- */
+
+type MotivoCierre = "REGULARIZACION" | "PLAN_DE_PAGO" | "CAMBIO_PARAMETRO" | "JUDICIALIZACION" | "OTRO";
+
+function CerrarProcesoDialog({
+  seleccionados,
+  motivosCierre,
+  onCancel,
+  onConfirm,
+  mutating = false,
+  compromisoVigente = null,
+  compromisoLoading = false,
+}: {
+  seleccionados: InmuebleMoroso[];
+  motivosCierre: MotivoCierreOption[] | null;
+  onCancel: () => void;
+  onConfirm: (data: AccionDialogConfirmPayload) => void;
+  mutating?: boolean;
+  compromisoVigente?: CompromisoVigente | null;
+  compromisoLoading?: boolean;
+}) {
+  const total = seleccionados.length;
+
+  const today = (() => {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d;
+  })();
+
+  const [motivo, setMotivo] = useState<MotivoCierre | "">("");
+  const motivosDisponibles = motivosCierre ?? [];
+  const isApiWithoutMotivos = motivosDisponibles.length === 0;
+  const [parametro, setParametro] = useState("");
+  const [valorAnterior, setValorAnterior] = useState("");
+  const [valorNuevo, setValorNuevo] = useState("");
+  const [observacion, setObservacion] = useState("");
+  const montoSugeridoRegularizacion = seleccionados.length === 1 ? seleccionados[0].montoAdeudado.toString() : "";
+  const [montoAbonado, setMontoAbonado] = useState(montoSugeridoRegularizacion);
+
+  // Regularización
+  const [fechaReg, setFechaReg] = useState<Date | undefined>(today);
+  const [openFechaReg, setOpenFechaReg] = useState(false);
+
+  // Plan de pago
+  const [fechaPlan, setFechaPlan] = useState<Date | undefined>(today);
+  const [openFechaPlan, setOpenFechaPlan] = useState(false);
+  const [cuotas, setCuotas] = useState<string>("6");
+  const [montoTotalPlan, setMontoTotalPlan] = useState<string>("0");
+  const [cuotasPagaAhora, setCuotasPagaAhora] = useState<string>("0");
+  const [fechaPrimera, setFechaPrimera] = useState<Date | undefined>(today);
+  const [openFechaPrimera, setOpenFechaPrimera] = useState(false);
+
+  const cuotasNum = parseInt(cuotas, 10);
+  const cuotasPagaAhoraNum = parseInt(cuotasPagaAhora, 10);
+  const montoTotalNum = Number(montoTotalPlan);
+  const cuotasValidas = Number.isFinite(cuotasNum) && cuotasNum > 0 && cuotasNum <= 120;
+  const pagaAhoraValido = Number.isFinite(cuotasPagaAhoraNum) && cuotasPagaAhoraNum >= 0 && cuotasPagaAhoraNum <= cuotasNum;
+  const montoValido = Number.isFinite(montoTotalNum) && montoTotalNum > 0;
+  const montoAbonadoNum = Number(montoAbonado);
+  const montoAbonadoValido = Number.isFinite(montoAbonadoNum) && montoAbonadoNum > 0;
+  const planCalculoValido = cuotasValidas && pagaAhoraValido && montoValido;
+  const valorCuotaCalculado = planCalculoValido ? montoTotalNum / cuotasNum : null;
+  const montoPagaAhoraCalculado = planCalculoValido ? valorCuotaCalculado * cuotasPagaAhoraNum : null;
+  const cuotasPendientesCalculadas = planCalculoValido ? cuotasNum - cuotasPagaAhoraNum : null;
+  const saldoPendienteCalculado = planCalculoValido ? montoTotalNum - montoPagaAhoraCalculado : null;
+
+  const puedeConfirmar = (() => {
+    if (isApiWithoutMotivos) return false;
+    if (!motivo) return false;
+    if (motivo === "REGULARIZACION") return !!fechaReg && montoAbonadoValido;
+    if (motivo === "PLAN_DE_PAGO") return !!fechaPlan && !!fechaPrimera && cuotasValidas && pagaAhoraValido && montoValido;
+    if (motivo === "CAMBIO_PARAMETRO") return parametro.trim() && valorAnterior.trim() && valorNuevo.trim();
+    if (motivo === "OTRO" || motivo === "JUDICIALIZACION")
+      return observacion.trim().length > 0;
+    return false;
+  })();
+
+  const handleConfirm = () => {
+    if (!puedeConfirmar) return;
+    const payload: Omit<CerrarProcesoPayload, "casoSeguimientoId"> = {
+      motivoCodigo: motivo,
+      observacion: observacion.trim() || undefined,
+    };
+    if (motivo === "REGULARIZACION") {
+      payload.montoAbonado = montoAbonadoNum;
+    }
+    if (motivo === "PLAN_DE_PAGO" && fechaPrimera) {
+      const valorCuota = valorCuotaCalculado!;
+      const montoPagaAhora = montoPagaAhoraCalculado!;
+      const saldoPendiente = saldoPendienteCalculado!;
+      const cuotasPendientes = cuotasPendientesCalculadas!;
+      const ok = window.confirm(`Monto total del plan: $${Math.round(montoTotalNum).toLocaleString("es-AR")}\nCantidad total de cuotas: ${cuotasNum}\nValor de cada cuota: $${Math.round(valorCuota).toLocaleString("es-AR")}\nCuotas que paga ahora: ${cuotasPagaAhoraNum}\nMonto a pagar ahora: $${Math.round(montoPagaAhora).toLocaleString("es-AR")}\nCuotas pendientes: ${cuotasPendientes}\nSaldo pendiente: $${Math.round(saldoPendiente).toLocaleString("es-AR")}`);
+      if (!ok) return;
+      payload.planPago = { montoTotalPlan: montoTotalNum, cantidadTotalCuotas: cuotasNum, cantidadCuotasQuePagaAhora: cuotasPagaAhoraNum, fechaVencimientoPrimeraCuota: format(fechaPrimera, "yyyy-MM-dd") };
+    }
+    if (motivo === "CAMBIO_PARAMETRO") {
+      payload.cambioParametro = { parametro: parametro.trim(), valorAnterior: valorAnterior.trim(), valorNuevo: valorNuevo.trim() };
+    }
+    onConfirm({ kind: "cerrar", payload });
+  };
+
+  return (
+    <Dialog open onOpenChange={(o) => !o && onCancel()}>
+      <DialogContent className="grid-rows-[auto_minmax(0,1fr)_auto] gap-0 overflow-hidden p-0 sm:max-w-xl">
+        {/* Header institucional */}
+        <DialogHeader className="space-y-1 border-b border-border bg-surface-muted/40 px-4 py-4 text-left sm:px-6">
+          <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+            <StopCircle className="h-3.5 w-3.5" />
+            Seguimiento de morosidad
+          </div>
+          <DialogTitle className="font-serif text-xl leading-tight">
+            Cerrar proceso
+          </DialogTitle>
+          <DialogDescription className="text-[12.5px]">
+            Indicá el motivo de cierre. El proceso quedará cerrado y se registrará en el historial del inmueble.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-5 overflow-y-auto px-4 py-4 sm:px-6 sm:py-5">
+          {compromisoLoading && <div className="text-sm text-muted-foreground">Cargando compromiso vigente...</div>}
+          {/* Cantidad seleccionada */}
+          <div className="flex items-center justify-between rounded-md border border-border bg-surface-muted/40 px-3 py-2.5">
+            <div className="flex items-center gap-2.5">
+              <div className="flex h-8 w-8 items-center justify-center rounded-md bg-primary-soft text-primary">
+                <Building2 className="h-4 w-4" />
+              </div>
+              <div>
+                <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  Inmuebles alcanzados
+                </div>
+                <div className="text-[13px] text-foreground">
+                  Se cerrará el proceso de cada inmueble seleccionado.
+                </div>
+              </div>
+            </div>
+            <div className="text-right">
+              <div className="font-serif text-2xl font-semibold tabular leading-none text-foreground">
+                {numberFmt.format(total)}
+              </div>
+              <div className="text-[10.5px] uppercase tracking-wider text-muted-foreground">
+                inmueble{total === 1 ? "" : "s"}
+              </div>
+            </div>
+          </div>
+
+          {/* Motivo de cierre */}
+          <div className="space-y-1.5">
+            <Label className="text-[12px] font-medium">
+              Motivo de cierre <span className="text-destructive">*</span>
+            </Label>
+            {isApiWithoutMotivos && (
+              <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-[12px] text-destructive">
+                No hay motivos de cierre activos disponibles desde API. No es posible cerrar procesos en este momento.
+              </div>
+            )}
+            <Select value={motivo} onValueChange={(v) => setMotivo(v as MotivoCierre)}>
+              <SelectTrigger className="h-9 text-[13px]" disabled={isApiWithoutMotivos}>
+                <SelectValue placeholder="Seleccionar motivo..." />
+              </SelectTrigger>
+              <SelectContent>
+                {motivosDisponibles.map((m) => (
+                  <SelectItem key={m.codigo} value={m.codigo} className="text-[13px]">
+                    {m.nombre}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          {/* CASO 1: Regularización total */}
+          {motivo === "REGULARIZACION" && (
+            <div className="space-y-4 rounded-md border border-border bg-surface-muted/30 px-4 py-3.5">
+              <div className="space-y-1.5">
+                <Label className="text-[12px] font-medium">
+                  Fecha de regularización <span className="text-destructive">*</span>
+                </Label>
+                <Popover open={openFechaReg} onOpenChange={setOpenFechaReg}>
+                  <PopoverTrigger asChild>
+                    <Button
+                      variant="outline"
+                      className={cn(
+                        "h-9 w-full justify-start text-left text-[13px] font-normal",
+                        !fechaReg && "text-muted-foreground",
+                      )}
+                    >
+                      <CalendarIcon className="mr-2 h-3.5 w-3.5 opacity-70" />
+                      {fechaReg
+                        ? format(fechaReg, "dd 'de' MMMM yyyy", { locale: es })
+                        : "Seleccionar fecha"}
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-auto p-0" align="start">
+                    <Calendar
+                      mode="single"
+                      selected={fechaReg}
+                      onSelect={(d) => {
+                        setFechaReg(d);
+                        setOpenFechaReg(false);
+                      }}
+                      initialFocus
+                      locale={es}
+                      className={cn("p-3 pointer-events-auto")}
+                    />
+                  </PopoverContent>
+                </Popover>
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-[12px] font-medium">Monto abonado <span className="text-destructive">*</span></Label>
+                <Input type="number" min={0.01} step="0.01" value={montoAbonado} onChange={(e) => setMontoAbonado(e.target.value)} className="h-9 text-[13px]" placeholder="Ej. 150000" />
+              </div>
+              <ObservacionField
+                value={observacion}
+                onChange={setObservacion}
+                required={false}
+              />
+            </div>
+          )}
+
+          {/* CASO 2: Plan de pago */}
+          {motivo === "PLAN_DE_PAGO" && (
+            <div className="space-y-4 rounded-md border border-border bg-surface-muted/30 px-4 py-3.5">
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div className="space-y-1.5">
+                  <Label className="text-[12px] font-medium">
+                    Fecha de creación <span className="text-destructive">*</span>
+                  </Label>
+                  <Popover open={openFechaPlan} onOpenChange={setOpenFechaPlan}>
+                    <PopoverTrigger asChild>
+                      <Button
+                        variant="outline"
+                        className={cn(
+                          "h-9 w-full justify-start text-left text-[13px] font-normal",
+                          !fechaPlan && "text-muted-foreground",
+                        )}
+                      >
+                        <CalendarIcon className="mr-2 h-3.5 w-3.5 opacity-70" />
+                        {fechaPlan
+                          ? format(fechaPlan, "dd/MM/yyyy", { locale: es })
+                          : "Seleccionar fecha"}
+                      </Button>
+                    </PopoverTrigger>
+                    <PopoverContent className="w-auto p-0" align="start">
+                      <Calendar
+                        mode="single"
+                        selected={fechaPlan}
+                        onSelect={(d) => {
+                          setFechaPlan(d);
+                          setOpenFechaPlan(false);
+                        }}
+                        initialFocus
+                        locale={es}
+                        className={cn("p-3 pointer-events-auto")}
+                      />
+                    </PopoverContent>
+                  </Popover>
+                </div>
+
+                <div className="space-y-1.5">
+                  <Label className="text-[12px] font-medium">Monto total del plan <span className="text-destructive">*</span></Label>
+                  <Input type="number" min={0.01} value={montoTotalPlan} onChange={(e) => setMontoTotalPlan(e.target.value)} className="h-9 text-[13px]" />
+                </div>
+                <div className="space-y-1.5">
+                  <Label className="text-[12px] font-medium">
+                    Cantidad total de cuotas <span className="text-destructive">*</span>
+                  </Label>
+                  <Input type="number" min={1} max={120} value={cuotas} onChange={(e) => setCuotas(e.target.value)} className="h-9 text-[13px]" placeholder="Ej. 6" />
+                </div>
+                <div className="space-y-1.5">
+                  <Label className="text-[12px] font-medium">Cuotas que paga ahora <span className="text-destructive">*</span></Label>
+                  <Input type="number" min={0} max={cuotasNum || 0} value={cuotasPagaAhora} onChange={(e) => setCuotasPagaAhora(e.target.value)} className="h-9 text-[13px]" />
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <Label className="text-[12px] font-medium">
+                  1° vencimiento <span className="text-destructive">*</span>
+                </Label>
+                <Popover open={openFechaPrimera} onOpenChange={setOpenFechaPrimera}>
+                  <PopoverTrigger asChild>
+                    <Button
+                      variant="outline"
+                      className={cn(
+                        "h-9 w-full justify-start text-left text-[13px] font-normal",
+                        !fechaPrimera && "text-muted-foreground",
+                      )}
+                    >
+                      <CalendarIcon className="mr-2 h-3.5 w-3.5 opacity-70" />
+                      {fechaPrimera
+                        ? format(fechaPrimera, "dd 'de' MMMM yyyy", { locale: es })
+                        : "Seleccionar fecha"}
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-auto p-0" align="start">
+                    <Calendar
+                      mode="single"
+                      selected={fechaPrimera}
+                      onSelect={(d) => {
+                        setFechaPrimera(d);
+                        setOpenFechaPrimera(false);
+                      }}
+                      initialFocus
+                      locale={es}
+                      className={cn("p-3 pointer-events-auto")}
+                    />
+                  </PopoverContent>
+                </Popover>
+                {fechaPrimera && cuotasValidas && cuotasNum > 1 && (
+                  <p className="text-[11.5px] text-muted-foreground">
+                    Las cuotas siguientes vencen el día {fechaPrimera.getDate()} de cada mes.
+                  </p>
+                )}
+              </div>
+
+              <ObservacionField
+                value={observacion}
+                onChange={setObservacion}
+                required={false}
+              />
+              <div className="rounded-md border border-border bg-background px-3 py-2 text-[12px]">
+                {planCalculoValido ? (
+                  <div className="space-y-1">
+                    <p className="font-medium">Resumen del plan:</p>
+                    <p>Valor de cada cuota: ${valorCuotaCalculado?.toLocaleString("es-AR", { maximumFractionDigits: 2 })}</p>
+                    <p>Cuotas que paga ahora: {cuotasPagaAhoraNum}</p>
+                    <p>Monto a pagar ahora: ${montoPagaAhoraCalculado?.toLocaleString("es-AR", { maximumFractionDigits: 2 })}</p>
+                    <p>Cuotas pendientes: {cuotasPendientesCalculadas}</p>
+                    <p>Saldo pendiente: ${saldoPendienteCalculado?.toLocaleString("es-AR", { maximumFractionDigits: 2 })}</p>
+                  </div>
+                ) : (
+                  <p className="text-muted-foreground">Completá los datos del plan para ver el cálculo.</p>
+                )}
+              </div>
+
+              <div className="flex items-start gap-2 rounded-md border border-border bg-background px-3 py-2 text-[11.5px] text-muted-foreground">
+                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                <span>
+                  El sistema solo guarda el plan como información histórica. No realiza seguimiento de cuotas.
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* CASO 3: Otros / Judicialización */}
+          {(motivo === "OTRO" || motivo === "JUDICIALIZACION") && (
+            <div className="space-y-4 rounded-md border border-border bg-surface-muted/30 px-4 py-3.5">
+              <div className="text-[11.5px] text-muted-foreground">
+                Fecha de cierre:{" "}
+                <span className="tabular font-medium text-foreground">
+                  {format(today, "dd/MM/yyyy")}
+                </span>{" "}
+                (automática)
+              </div>
+              <ObservacionField
+                value={observacion}
+                onChange={setObservacion}
+                required
+              />
+            </div>
+          )}
+
+          {motivo === "CAMBIO_PARAMETRO" && (
+            <div className="space-y-4 rounded-md border border-border bg-surface-muted/30 px-4 py-3.5">
+              <div className="grid gap-4 sm:grid-cols-3">
+                <Input value={parametro} onChange={(e) => setParametro(e.target.value)} placeholder="Parámetro" className="h-9 text-[13px]" />
+                <Input value={valorAnterior} onChange={(e) => setValorAnterior(e.target.value)} placeholder="Valor anterior" className="h-9 text-[13px]" />
+                <Input value={valorNuevo} onChange={(e) => setValorNuevo(e.target.value)} placeholder="Valor nuevo" className="h-9 text-[13px]" />
+              </div>
+              <ObservacionField value={observacion} onChange={setObservacion} required={false} />
+            </div>
+          )}
+
+          {motivo && (
+            <div className="flex items-start gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-[12.5px] text-emerald-800 dark:text-emerald-300">
+              <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>
+                Al confirmar, el proceso quedará{" "}
+                <span className="font-semibold">cerrado</span> de forma definitiva.
+              </span>
+            </div>
+          )}
+        </div>
+
+        {/* Footer */}
+        <DialogFooter className="flex-col-reverse gap-2 border-t border-border bg-surface-muted/40 px-4 py-3 sm:flex-row sm:items-center sm:justify-end sm:px-6">
+          <Button variant="outline" onClick={onCancel} className="h-9">
+            Cancelar
+          </Button>
+          <Button onClick={handleConfirm} disabled={!puedeConfirmar || mutating} className="h-9">
+            Confirmar cierre
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function ObservacionField({
+  value,
+  onChange,
+  required,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  required: boolean;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-baseline justify-between">
+        <Label className="text-[12px] font-medium">
+          Observación{" "}
+          {required ? (
+            <span className="text-destructive">*</span>
+          ) : (
+            <span className="text-[11px] font-normal text-muted-foreground">(opcional)</span>
+          )}
+        </Label>
+        <span className="text-[10.5px] tabular text-muted-foreground">{value.length}/500</span>
+      </div>
+      <Textarea
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder="Detalle del cierre..."
+        rows={3}
+        maxLength={500}
+        className="resize-none text-[13px]"
+      />
+    </div>
+  );
+}
+
+/* -------- Modal institucional: Compromiso de pago -------- */
+
+function CompromisoPagoDialog({
+  seleccionados,
+  onCancel,
+  onConfirm,
+  mutating = false,
+  compromisoVigente = null,
+  compromisoLoading = false,
+}: {
+  seleccionados: InmuebleMoroso[];
+  onCancel: () => void;
+  onConfirm: (data: AccionDialogConfirmPayload) => void;
+  mutating?: boolean;
+  compromisoVigente?: CompromisoVigente | null;
+  compromisoLoading?: boolean;
+}) {
+  const total = seleccionados.length;
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const en30 = new Date(today);
+  en30.setDate(en30.getDate() + 30);
+
+  const [desde, setDesde] = useState<Date | undefined>(today);
+  const [hasta, setHasta] = useState<Date | undefined>(en30);
+  const [observacion, setObservacion] = useState("");
+  const [montoComprometido, setMontoComprometido] = useState("");
+
+  useEffect(() => {
+    if (!compromisoVigente) return;
+    setDesde(new Date(`${compromisoVigente.fechaDesde}T00:00:00`));
+    setHasta(new Date(`${compromisoVigente.fechaHasta}T00:00:00`));
+    setMontoComprometido(compromisoVigente.montoComprometido != null ? String(compromisoVigente.montoComprometido) : "");
+    setObservacion(compromisoVigente.observacion ?? "");
+  }, [compromisoVigente]);
+  const [openDesde, setOpenDesde] = useState(false);
+  const [openHasta, setOpenHasta] = useState(false);
+
+  const rangoInvalido = !!(desde && hasta && hasta.getTime() < desde.getTime());
+  const puedeConfirmar = !!desde && !!hasta && !rangoInvalido;
+
+  const handleConfirm = () => {
+    if (!puedeConfirmar || !desde || !hasta) return;
+onConfirm({ kind: "compromiso", payload: { compromisoId: compromisoVigente?.id, fechaDesde: format(desde, "yyyy-MM-dd"), fechaHasta: format(hasta, "yyyy-MM-dd"), montoComprometido: montoComprometido.trim() ? Number(montoComprometido) : undefined, observacion: observacion.trim() || undefined } });
+  };
+
+  return (
+    <Dialog open onOpenChange={(o) => !o && onCancel()}>
+      <DialogContent className="grid-rows-[auto_minmax(0,1fr)_auto] gap-0 overflow-hidden p-0 sm:max-w-xl">
+        {/* Header institucional */}
+        <DialogHeader className="space-y-1 border-b border-border bg-surface-muted/40 px-4 py-4 text-left sm:px-6">
+          <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+            <HandCoins className="h-3.5 w-3.5" />
+            Seguimiento de morosidad
+          </div>
+          <DialogTitle className="font-serif text-xl leading-tight">
+            {compromisoVigente ? "Editar compromiso de pago" : "Registrar compromiso de pago"}
+          </DialogTitle>
+          <DialogDescription className="text-[12.5px]">
+            Definí el período comprometido por el contribuyente. El proceso quedará pausado mientras esté vigente.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-5 overflow-y-auto px-4 py-4 sm:px-6 sm:py-5">
+          {compromisoLoading && <div className="text-sm text-muted-foreground">Cargando compromiso vigente...</div>}
+          {/* Cantidad seleccionada */}
+          <div className="flex items-center justify-between rounded-md border border-border bg-surface-muted/40 px-3 py-2.5">
+            <div className="flex items-center gap-2.5">
+              <div className="flex h-8 w-8 items-center justify-center rounded-md bg-primary-soft text-primary">
+                <Building2 className="h-4 w-4" />
+              </div>
+              <div>
+                <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  Inmuebles alcanzados
+                </div>
+                <div className="text-[13px] text-foreground">
+                  Si existe compromiso vigente se editará; si no existe, se registrará uno nuevo.
+                </div>
+              </div>
+            </div>
+            <div className="text-right">
+              <div className="font-serif text-2xl font-semibold tabular leading-none text-foreground">
+                {numberFmt.format(total)}
+              </div>
+              <div className="text-[10.5px] uppercase tracking-wider text-muted-foreground">
+                inmueble{total === 1 ? "" : "s"}
+              </div>
+            </div>
+          </div>
+
+          {/* Fecha desde / Fecha hasta */}
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="space-y-1.5">
+              <Label className="text-[12px] font-medium">
+                Fecha desde <span className="text-destructive">*</span>
+              </Label>
+              <Popover open={openDesde} onOpenChange={setOpenDesde}>
+                <PopoverTrigger asChild>
+                  <Button
+                    variant="outline"
+                    className={cn(
+                      "h-9 w-full justify-start text-left text-[13px] font-normal",
+                      !desde && "text-muted-foreground",
+                    )}
+                  >
+                    <CalendarIcon className="mr-2 h-3.5 w-3.5 opacity-70" />
+                    {desde
+                      ? format(desde, "dd 'de' MMMM yyyy", { locale: es })
+                      : "Seleccionar fecha"}
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent className="w-auto p-0" align="start">
+                  <Calendar
+                    mode="single"
+                    selected={desde}
+                    onSelect={(d) => {
+                      setDesde(d);
+                      setOpenDesde(false);
+                    }}
+                    initialFocus
+                    locale={es}
+                    className={cn("p-3 pointer-events-auto")}
+                  />
+                </PopoverContent>
+              </Popover>
+            </div>
+
+            <div className="space-y-1.5">
+              <Label className="text-[12px] font-medium">
+                Fecha hasta <span className="text-destructive">*</span>
+              </Label>
+              <Popover open={openHasta} onOpenChange={setOpenHasta}>
+                <PopoverTrigger asChild>
+                  <Button
+                    variant="outline"
+                    className={cn(
+                      "h-9 w-full justify-start text-left text-[13px] font-normal",
+                      !hasta && "text-muted-foreground",
+                      rangoInvalido && "border-destructive text-destructive",
+                    )}
+                  >
+                    <CalendarIcon className="mr-2 h-3.5 w-3.5 opacity-70" />
+                    {hasta
+                      ? format(hasta, "dd 'de' MMMM yyyy", { locale: es })
+                      : "Seleccionar fecha"}
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent className="w-auto p-0" align="start">
+                  <Calendar
+                    mode="single"
+                    selected={hasta}
+                    onSelect={(d) => {
+                      setHasta(d);
+                      setOpenHasta(false);
+                    }}
+                    disabled={(d) => (desde ? d.getTime() < desde.getTime() : false)}
+                    initialFocus
+                    locale={es}
+                    className={cn("p-3 pointer-events-auto")}
+                  />
+                </PopoverContent>
+              </Popover>
+              {rangoInvalido && (
+                <p className="text-[11.5px] text-destructive">
+                  La fecha hasta no puede ser anterior a la fecha desde.
+                </p>
+              )}
+            </div>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label className="text-[12px] font-medium">Monto comprometido <span className="text-[11px] font-normal text-muted-foreground">(opcional)</span></Label>
+            <Input type="number" min={0} value={montoComprometido} onChange={(e) => setMontoComprometido(e.target.value)} className="h-9 text-[13px]" placeholder="Ej. 150000" />
+          </div>
+
+          {/* Observación */}
+          <div className="space-y-1.5">
+            <div className="flex items-baseline justify-between">
+              <Label className="text-[12px] font-medium">Observación</Label>
+              <span className="text-[11px] text-muted-foreground">Opcional</span>
+            </div>
+            <Textarea
+              value={observacion}
+              onChange={(e) => setObservacion(e.target.value)}
+              placeholder="Detalle del compromiso (ej. acordado por mostrador, plan informal, etc.)"
+              rows={3}
+              maxLength={500}
+              className="resize-none text-[13px]"
+            />
+            <div className="text-right text-[10.5px] tabular text-muted-foreground">
+              {observacion.length}/500
+            </div>
+          </div>
+
+          {/* Aviso de pausa */}
+          <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[12.5px] text-amber-800 dark:text-amber-300">
+            <PauseCircle className="mt-0.5 h-4 w-4 shrink-0" />
+            <span>
+              Al confirmar, el proceso de seguimiento quedará{" "}
+              <span className="font-semibold">pausado</span> mientras el compromiso esté vigente.
+            </span>
+          </div>
+        </div>
+
+        {/* Footer institucional */}
+        <DialogFooter className="flex-col-reverse gap-2 border-t border-border bg-surface-muted/40 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+          <div className="text-[12px] text-muted-foreground">
+            {desde && hasta && !rangoInvalido ? (
+              <>
+                Vigencia:{" "}
+                <span className="tabular font-semibold text-foreground">
+                  {format(desde, "dd/MM/yyyy")} – {format(hasta, "dd/MM/yyyy")}
+                </span>
+              </>
+            ) : (
+              "Definí el período de vigencia"
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <Button variant="outline" onClick={onCancel} className="h-9">
+              Cancelar
+            </Button>
+            <Button onClick={handleConfirm} disabled={!puedeConfirmar || mutating} className="h-9">
+              {compromisoVigente ? "Guardar cambios" : "Guardar compromiso"}
+            </Button>
+          </div>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function accionInfo(accion: AccionMasiva | null): { titulo: string; descripcion: string } {
+  if (!accion) return { titulo: "", descripcion: "" };
+  switch (accion.kind) {
+    case "enviar-etapa":
+      return {
+        titulo: `Enviar a "${accion.etapa}"`,
+        descripcion: "Los inmuebles avanzarán manualmente a la etapa seleccionada. Recordá que las etapas no pueden retroceder.",
+      };
+    case "enviar-siguiente":
+      return {
+        titulo: "Enviar a etapa siguiente",
+        descripcion: "Cada inmueble avanzará una posición en el proceso configurado.",
+      };
+    case "iniciar":
+      return {
+        titulo: "Iniciar proceso",
+        descripcion: "Se iniciará el seguimiento en la primera etapa configurada para los inmuebles seleccionados.",
+      };
+    case "cerrar":
+      return {
+        titulo: "Cerrar proceso",
+        descripcion: "El proceso actual quedará cerrado. La acción registrará el cierre en el historial del inmueble.",
+      };
+    case "compromiso":
+      return {
+        titulo: "Compromiso de pago",
+        descripcion: "Si hay compromiso vigente se actualiza; si no, se registra uno nuevo manteniendo el proceso pausado.",
+      };
+    case "pausar":
+      return {
+        titulo: "Pausar proceso",
+        descripcion: "El proceso y su etapa actual quedarán pausados hasta que se reanude el caso.",
+      };
+    case "repetir-etapa":
+      return {
+        titulo: "Repetir etapa actual",
+        descripcion: "Se registrará una repetición operativa de la etapa actual del proceso.",
+      };
+    case "reanudar":
+      return {
+        titulo: "Reanudar proceso",
+        descripcion: "Se reanudará el caso pausado y volverá al flujo activo en la misma etapa.",
+      };
+    default:
+      return {
+        titulo: "Acción no disponible",
+        descripcion: "La acción solicitada no tiene configuración en esta pantalla.",
+      };
+  }
+}
+
+/* -------- Modal institucional: Mover a etapa -------- */
+
+function MoverEtapaDialog({
+  accion,
+  etapasOperativas,
+  seleccionados,
+  selectedActions,
+  onCancel,
+  onConfirm,
+  mutating = false,
+  compromisoVigente = null,
+  compromisoLoading = false,
+}: {
+  accion: Extract<AccionMasiva, { kind: "enviar-etapa" }>;
+  etapasOperativas: EtapaSeguimiento[];
+  seleccionados: InmuebleMoroso[];
+  selectedActions?: {
+    canAvanzar: boolean;
+    reasons: Record<string, string | null>;
+  };
+  onCancel: () => void;
+  onConfirm: (data: AccionDialogConfirmPayload) => void;
+  mutating?: boolean;
+  compromisoVigente?: CompromisoVigente | null;
+  compromisoLoading?: boolean;
+}) {
+  const total = seleccionados.length;
+  const { toast } = useToast();
+  const [etapaDestino, setEtapaDestino] = useState<EtapaSeguimiento | null>(() => accion.etapa ?? etapasOperativas[0] ?? null);
+  const [fecha, setFecha] = useState<Date | undefined>(() => {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d;
+  });
+  const [observacion, setObservacion] = useState("");
+  const [calOpen, setCalOpen] = useState(false);
+  const [accionMismaEtapa, setAccionMismaEtapa] = useState<"repetir" | "omitir">("omitir");
+
+  const etapaDestinoId = etapaDestino ? String(etapaDestino).trim() : "";
+  const etapaDestinoValida = etapaDestinoId.length > 0;
+  const idxDestino = etapaIndexEnLista(etapaDestino, etapasOperativas);
+  const idxPrimeraEtapa = etapasOperativas.length > 0 ? 0 : -1;
+  const destinoEsPrimeraEtapa = idxDestino === idxPrimeraEtapa;
+  const enEtapaPosterior = seleccionados.filter((m) => m.casoId && etapaIndexEnLista(m.etapa, etapasOperativas) > idxDestino).length;
+  const enMismaEtapa = seleccionados.filter((m) => m.casoId && etapaIndexEnLista(m.etapa, etapasOperativas) === idxDestino).length;
+  const enEtapaAnterior = seleccionados.filter((m) => m.casoId && etapaIndexEnLista(m.etapa, etapasOperativas) < idxDestino).length;
+  const sinSeguimiento = seleccionados.filter((m) => !m.casoId).length;
+  const casosConSeguimiento = seleccionados.filter((m) => !!m.casoId).length;
+  const sinSeguimientoIniciables = destinoEsPrimeraEtapa ? sinSeguimiento : 0;
+  const sinSeguimientoOmitidos = destinoEsPrimeraEtapa ? 0 : sinSeguimiento;
+  const mismaEtapaRepetir = accionMismaEtapa === "repetir" ? enMismaEtapa : 0;
+  const mismaEtapaOmitir = accionMismaEtapa === "omitir" ? enMismaEtapa : 0;
+  const aplicables = enEtapaAnterior + mismaEtapaRepetir + sinSeguimientoIniciables;
+  const canConfirmApi = etapaDestinoValida && etapasOperativas.length > 0 && casosConSeguimiento > 0 && (selectedActions?.canAvanzar ?? false) && !mutating;
+  const canConfirm = USE_API ? canConfirmApi : aplicables > 0 && !mutating;
+  const blockedReasonApi = !etapaDestinoValida
+    ? "Seleccione una etapa destino."
+    : selectedActions?.reasons?.enviarEtapa ?? null;
+
+  const handleConfirm = () => {
+    if (!etapaDestinoValida) {
+      toast({
+        title: "Dato requerido",
+        description: "Seleccione una etapa destino.",
+        variant: "destructive",
+      });
+      return;
+    }
+    onConfirm({
+      kind: "enviar-etapa",
+      payload: {
+        observacion: observacion.trim() || undefined,
+        etapaDestinoId: etapaDestinoId,
+        repetirMismaEtapa: accionMismaEtapa === "repetir",
+      },
+    });
+  };
+
+  return (
+    <Dialog open onOpenChange={(o) => !o && onCancel()}>
+      <DialogContent className="grid-rows-[auto_minmax(0,1fr)_auto] gap-0 overflow-hidden p-0 sm:max-w-xl">
+        {/* Header institucional */}
+        <DialogHeader className="space-y-1 border-b border-border bg-surface-muted/40 px-4 py-4 text-left sm:px-6">
+          <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+            <Layers className="h-3.5 w-3.5" />
+            Gestión de etapas
+          </div>
+          <DialogTitle className="font-serif text-xl leading-tight">
+            Mover inmuebles a una etapa
+          </DialogTitle>
+          <DialogDescription className="text-[12.5px]">
+            Operación manual e irreversible: las etapas no admiten retroceso.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-5 overflow-y-auto px-4 py-4 sm:px-6 sm:py-5">
+          {compromisoLoading && <div className="text-sm text-muted-foreground">Cargando compromiso vigente...</div>}
+          {/* Cantidad seleccionada */}
+          <div className="flex items-center justify-between rounded-md border border-border bg-surface-muted/40 px-3 py-2.5">
+            <div className="flex items-center gap-2.5">
+              <div className="flex h-8 w-8 items-center justify-center rounded-md bg-primary-soft text-primary">
+                <Building2 className="h-4 w-4" />
+              </div>
+              <div>
+                <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  Inmuebles seleccionados
+                </div>
+                <div className="text-[13px] text-foreground">
+                  Se aplicará la operación al conjunto seleccionado.
+                </div>
+
+              </div>
+            </div>
+            <div className="text-right">
+              <div className="font-serif text-2xl font-semibold tabular leading-none text-foreground">
+                {numberFmt.format(total)}
+              </div>
+              <div className="text-[10.5px] uppercase tracking-wider text-muted-foreground">
+                inmueble{total === 1 ? "" : "s"}
+              </div>
+            </div>
+          </div>
+
+          {/* Etapa destino + Fecha programada */}
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="space-y-1.5">
+              <Label className="text-[12px] font-medium">
+                Etapa destino <span className="text-destructive">*</span>
+              </Label>
+              <Select
+                value={etapaDestino ?? undefined}
+                onValueChange={(v) => setEtapaDestino(v as EtapaSeguimiento)}
+              >
+                <SelectTrigger className="h-9 text-[13px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {etapasOperativas.map((e) => (
+                    <SelectItem key={e} value={e} className="text-[13px]">
+                      {e}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-[11.5px] text-muted-foreground">
+                Solo se mueven hacia adelante en el proceso configurado.
+              </p>
+              {!etapaDestinoValida && (
+                <p className="text-[11.5px] text-destructive">Seleccione una etapa destino.</p>
+              )}
+            </div>
+
+            <div className="space-y-1.5">
+              <Label className="text-[12px] font-medium">Fecha programada</Label>
+              <Popover open={calOpen} onOpenChange={setCalOpen}>
+                <PopoverTrigger asChild>
+                  <Button
+                    variant="outline"
+                    className={cn(
+                      "h-9 w-full justify-start text-left text-[13px] font-normal",
+                      !fecha && "text-muted-foreground",
+                    )}
+                  >
+                    <CalendarIcon className="mr-2 h-3.5 w-3.5 opacity-70" />
+                    {fecha
+                      ? format(fecha, "dd 'de' MMMM yyyy", { locale: es })
+                      : "Sin fecha"}
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent className="w-auto p-0" align="start">
+                  <Calendar
+                    mode="single"
+                    selected={fecha}
+                    onSelect={(d) => {
+                      setFecha(d);
+                      setCalOpen(false);
+                    }}
+                    initialFocus
+                    locale={es}
+                    className={cn("p-3 pointer-events-auto")}
+                  />
+                </PopoverContent>
+              </Popover>
+              <p className="text-[11.5px] text-muted-foreground">
+                Solo informativa para planificación operativa.
+              </p>
+            </div>
+          </div>
+
+          {/* Observación opcional */}
+          <div className="space-y-1.5">
+            <div className="flex items-baseline justify-between">
+              <Label className="text-[12px] font-medium">Observación</Label>
+              <span className="text-[11px] text-muted-foreground">Opcional</span>
+            </div>
+            <Textarea
+              value={observacion}
+              onChange={(e) => setObservacion(e.target.value)}
+              placeholder="Detalle interno del movimiento (motivo, instrucción al área, etc.)"
+              rows={3}
+              maxLength={500}
+              className="resize-none text-[13px]"
+            />
+            <div className="text-right text-[10.5px] tabular text-muted-foreground">
+              {observacion.length}/500
+            </div>
+          </div>
+
+          <div className="rounded-md border border-border bg-surface-muted/40 px-3 py-2.5 text-[12.5px]">
+            <div className="font-medium">Resumen previo (informativo)</div>
+            <ul className="mt-1 space-y-0.5 text-muted-foreground">
+              <li>Total seleccionados: {numberFmt.format(total)}</li>
+              <li>Pueden avanzar (etapa anterior): {numberFmt.format(enEtapaAnterior)}</li>
+              <li>En etapa posterior (omitidos): {numberFmt.format(enEtapaPosterior)}</li>
+              <li>En misma etapa: {numberFmt.format(enMismaEtapa)}</li>
+              <li>Sin seguimiento iniciado: {numberFmt.format(sinSeguimiento)}</li>
+              <li>Sin seguimiento a iniciar (si destino es primera): {numberFmt.format(sinSeguimientoIniciables)}</li>
+              <li>Sin seguimiento omitidos: {numberFmt.format(sinSeguimientoOmitidos)}</li>
+            </ul>
+          </div>
+
+          {enMismaEtapa > 0 && (
+            <div className="space-y-2 rounded-md border border-border px-3 py-2.5">
+              <div className="text-[12.5px]">
+                <span className="font-semibold">{enMismaEtapa}</span> casos ya se encuentran en la etapa destino. ¿Querés repetir la etapa para esos casos o dejarlos omitidos?
+              </div>
+              <RadioGroup value={accionMismaEtapa} onValueChange={(v) => setAccionMismaEtapa(v as "repetir" | "omitir")}>
+                <div className="flex items-center space-x-2">
+                  <RadioGroupItem value="repetir" id="misma-etapa-repetir" />
+                  <Label htmlFor="misma-etapa-repetir" className="text-[12.5px]">Repetir etapa actual</Label>
+                </div>
+                <div className="flex items-center space-x-2">
+                  <RadioGroupItem value="omitir" id="misma-etapa-omitir" />
+                  <Label htmlFor="misma-etapa-omitir" className="text-[12.5px]">Omitir sin cambios</Label>
+                </div>
+              </RadioGroup>
+            </div>
+          )}
+
+          {/* Aviso de bloqueos por no-retroceso */}
+          {enEtapaPosterior > 0 && (
+            <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[12.5px] text-amber-800 dark:text-amber-300">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>
+                No se puede retroceder. Algunos casos seleccionados se encuentran en una etapa posterior a la etapa destino.
+              </span>
+            </div>
+          )}
+          {sinSeguimientoOmitidos > 0 && (
+            <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[12.5px] text-amber-800 dark:text-amber-300">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>
+                Algunos inmuebles no tienen seguimiento iniciado y no pueden enviarse directamente a una etapa avanzada.
+              </span>
+            </div>
+          )}
+          {USE_API && casosConSeguimiento === 0 && (
+            <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-[12.5px] text-destructive">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>
+                No hay casos de seguimiento iniciados para enviar a una etapa determinada.
+              </span>
+            </div>
+          )}
+          {USE_API && blockedReasonApi && (
+            <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-[12.5px] text-destructive">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>{blockedReasonApi}</span>
+            </div>
+          )}
+        </div>
+
+        {/* Footer institucional con resumen */}
+        <DialogFooter className="flex-col-reverse gap-2 border-t border-border bg-surface-muted/40 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+          <div className="text-[12px] text-muted-foreground">
+            Se aplicará a{" "}
+            <span className="tabular font-semibold text-foreground">
+              {numberFmt.format(aplicables)}
+            </span>{" "}
+            de {numberFmt.format(total)}
+          </div>
+          <div className="flex items-center gap-2">
+            <Button variant="outline" onClick={onCancel} className="h-9">
+              Cancelar
+            </Button>
+            <Button onClick={handleConfirm} disabled={!canConfirm} className="h-9" title={USE_API ? (blockedReasonApi ?? undefined) : undefined}>
+              Confirmar movimiento
+            </Button>
+          </div>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}

@@ -1,0 +1,355 @@
+package pe.morosos.dashboard.service;
+
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.TypedQuery;
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.time.temporal.TemporalAdjusters;
+import java.util.*;
+import java.util.stream.Collectors;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+import pe.morosos.dashboard.dto.DashboardAccionesMesResponse;
+import pe.morosos.dashboard.dto.DashboardActividadMesResponse;
+import pe.morosos.dashboard.dto.DashboardDistritoResponse;
+import pe.morosos.dashboard.dto.DashboardKpisResponse;
+import pe.morosos.dashboard.dto.DashboardMovimientoResponse;
+import pe.morosos.dashboard.dto.DashboardResumenResponse;
+import pe.morosos.deuda.entity.CargaDeuda;
+import pe.morosos.deuda.entity.CargaDeudaEstado;
+import pe.morosos.deuda.repository.CargaDeudaRepository;
+import pe.morosos.parametro.service.ParametroSeguimientoRulesService;
+import pe.morosos.seguimiento.entity.CasoEventoTipo;
+
+@Service
+@RequiredArgsConstructor
+public class DashboardService {
+    private final CargaDeudaRepository cargaDeudaRepository;
+    private final ParametroSeguimientoRulesService parametroSeguimientoRulesService;
+    private final EntityManager entityManager;
+
+    public DashboardResumenResponse resumen(LocalDate fechaDesde, LocalDate fechaHasta, UUID grupoId, UUID distritoId) {
+        int cuotasMin = parametroSeguimientoRulesService.cuotasMinimasMorosidad();
+        Optional<CargaDeuda> cargaOpt = cargaDeudaRepository.findFirstByEstadoInOrderByCreatedAtDesc(
+                List.of(CargaDeudaEstado.COMPLETADA, CargaDeudaEstado.COMPLETADA_CON_ERRORES));
+
+        if (cargaOpt.isEmpty()) {
+            return new DashboardResumenResponse(
+                    new DashboardKpisResponse(0, 0, 0, 0, 0, BigDecimal.ZERO),
+                    new DashboardActividadMesResponse(0, 0, BigDecimal.ZERO, BigDecimal.ZERO),
+                    new DashboardAccionesMesResponse(0, 0, 0, 0, 0, 0, 0),
+                    List.of(),
+                    List.of());
+        }
+
+        UUID cargaId = cargaOpt.get().getId();
+        Instant inicio = inicioRango(fechaDesde);
+        Instant fin = finRango(fechaHasta);
+
+        DashboardKpisResponse kpis = queryKpis(cargaId, cuotasMin, grupoId, distritoId);
+        DashboardAccionesMesResponse acciones = queryAccionesMes(inicio, fin, grupoId, distritoId);
+        DashboardActividadMesResponse actividadMes = queryActividadMes(inicio, fin, grupoId, distritoId, kpis.montoTotalDeuda(), acciones);
+        List<DashboardDistritoResponse> distritos = queryDistritos(cargaId, cuotasMin, grupoId, distritoId, inicio, fin);
+        List<DashboardMovimientoResponse> movimientos = queryMovimientos(inicio, fin, grupoId, distritoId);
+
+        return new DashboardResumenResponse(kpis, actividadMes, acciones, distritos, movimientos);
+    }
+
+    private DashboardActividadMesResponse queryActividadMes(Instant inicio, Instant fin, UUID grupoId, UUID distritoId,
+                                                            BigDecimal deudaVigente, DashboardAccionesMesResponse accionesMes) {
+        BigDecimal regularizacionesMonto = decimalOrZero(entityManager.createQuery("""
+                select coalesce(sum(coalesce(p.montoAbonado, 0)), 0)
+                from ProcesoCierre p
+                join p.casoSeguimiento c
+                join c.inmueble i
+                join p.motivoCierre m
+                where i.esPrueba = false and p.fechaCierre >= :inicio and p.fechaCierre < :fin
+                  and upper(m.codigo) = 'REGULARIZACION'
+                  and (:grupoId is null or i.grupo.id = :grupoId)
+                  and (:distritoId is null or i.distrito.id = :distritoId)
+                """, BigDecimal.class)
+                .setParameter("inicio", inicio)
+                .setParameter("fin", fin)
+                .setParameter("grupoId", grupoId)
+                .setParameter("distritoId", distritoId)
+                .getSingleResult());
+
+        BigDecimal planesPagoMonto = decimalOrZero(entityManager.createQuery("""
+                select coalesce(sum(coalesce(pp.montoPagadoInicial, 0)), 0)
+                from ProcesoCierrePlanPago pp
+                join pp.procesoCierre p
+                join p.casoSeguimiento c
+                join c.inmueble i
+                where i.esPrueba = false and p.fechaCierre >= :inicio and p.fechaCierre < :fin
+                  and (:grupoId is null or i.grupo.id = :grupoId)
+                  and (:distritoId is null or i.distrito.id = :distritoId)
+                """, BigDecimal.class)
+                .setParameter("inicio", inicio)
+                .setParameter("fin", fin)
+                .setParameter("grupoId", grupoId)
+                .setParameter("distritoId", distritoId)
+                .getSingleResult());
+
+        BigDecimal montoRecaudado = regularizacionesMonto.add(planesPagoMonto);
+        long regularizacionesYPlanes = accionesMes.regularizaciones() + accionesMes.planesPago();
+        return new DashboardActividadMesResponse(regularizacionesYPlanes, accionesMes.compromisosPago(), montoRecaudado, deudaVigente);
+    }
+
+    private DashboardKpisResponse queryKpis(UUID cargaId, int minCuotas, UUID grupoId, UUID distritoId) {
+        Object[] row = entityManager.createQuery("""
+                select count(i.id),
+                       coalesce(sum(case when coalesce(de.cuotasAdeudadas, d.cuotasVencidas, 0) > 0
+                                          and coalesce(de.cuotasAdeudadas, d.cuotasVencidas, 0) < :min then 1 else 0 end), 0),
+                       coalesce(sum(case when coalesce(de.cuotasAdeudadas, d.cuotasVencidas, 0) >= :min then 1 else 0 end), 0),
+                       coalesce(sum(coalesce(de.montoAdeudado, d.montoVencido, 0)), 0)
+                from Inmueble i
+                left join CargaDeudaDetalle d on d.inmueble.id = i.id and d.cargaDeuda.id = :cargaId
+                left join DeudaEfectivaActual de on de.inmueble.id = i.id
+                where i.esPrueba = false and (:grupoId is null or i.grupo.id = :grupoId)
+                  and (:distritoId is null or i.distrito.id = :distritoId)
+                  and i.activo = true
+                """, Object[].class)
+                .setParameter("cargaId", cargaId)
+                .setParameter("min", minCuotas)
+                .setParameter("grupoId", grupoId)
+                .setParameter("distritoId", distritoId)
+                .getSingleResult();
+
+        long total = ((Number) row[0]).longValue();
+        long deudores = ((Number) row[1]).longValue();
+        long morosos = ((Number) row[2]).longValue();
+        BigDecimal monto = decimalOrZero(row[3]);
+        long alDia = Math.max(0, total - deudores - morosos);
+        double porcentaje = total == 0 ? 0 : morosos * 100d / total;
+        return new DashboardKpisResponse(total, alDia, deudores, morosos, porcentaje, monto);
+    }
+
+    private List<DashboardDistritoResponse> queryDistritos(UUID cargaId, int minCuotas, UUID grupoId, UUID distritoId,
+                                                           Instant inicio, Instant fin) {
+        List<Object[]> rows = entityManager.createQuery("""
+                select dist.id, dist.nombre,
+                       count(i.id),
+                       coalesce(sum(case when coalesce(de.cuotasAdeudadas, d.cuotasVencidas, 0) > 0
+                                          and coalesce(de.cuotasAdeudadas, d.cuotasVencidas, 0) < :min then 1 else 0 end), 0),
+                       coalesce(sum(case when coalesce(de.cuotasAdeudadas, d.cuotasVencidas, 0) >= :min then 1 else 0 end), 0),
+                       coalesce(sum(coalesce(de.montoAdeudado, d.montoVencido, 0)), 0)
+                from Inmueble i
+                join i.distrito dist
+                left join CargaDeudaDetalle d on d.inmueble.id = i.id and d.cargaDeuda.id = :cargaId
+                left join DeudaEfectivaActual de on de.inmueble.id = i.id
+                where i.esPrueba = false and (:grupoId is null or i.grupo.id = :grupoId)
+                  and (:distritoId is null or i.distrito.id = :distritoId)
+                  and i.activo = true
+                group by dist.id, dist.nombre
+                order by dist.nombre asc
+                """, Object[].class)
+                .setParameter("cargaId", cargaId)
+                .setParameter("min", minCuotas)
+                .setParameter("grupoId", grupoId)
+                .setParameter("distritoId", distritoId)
+                .getResultList();
+
+        Map<UUID, DistritosAccionAgg> accionesPorDistrito = queryAccionesPorDistrito(inicio, fin, grupoId, distritoId);
+
+        List<DashboardDistritoResponse> out = new ArrayList<>();
+        for (Object[] r : rows) {
+            UUID distId = (UUID) r[0];
+            DistritosAccionAgg agg = accionesPorDistrito.getOrDefault(distId, DistritosAccionAgg.ZERO);
+            long total = ((Number) r[2]).longValue();
+            long deudores = ((Number) r[3]).longValue();
+            long morosos = ((Number) r[4]).longValue();
+            long alDia = Math.max(0, total - deudores - morosos);
+            double porcentaje = total == 0 ? 0 : morosos * 100d / total;
+            out.add(new DashboardDistritoResponse(
+                    distId,
+                    (String) r[1],
+                    total,
+                    alDia,
+                    deudores,
+                    morosos,
+                    porcentaje,
+                    decimalOrZero(r[5]),
+                    agg.avisosDeuda,
+                    agg.avisosCorte,
+                    agg.intimaciones,
+                    agg.cortes));
+        }
+        return out;
+    }
+
+    private DashboardAccionesMesResponse queryAccionesMes(Instant inicio, Instant fin, UUID grupoId, UUID distritoId) {
+        Object[] eventos = entityManager.createQuery("""
+                select
+                    coalesce(sum(case when upper(coalesce(ed.codigo, '')) in :codigosAvisoDeuda then 1 else 0 end), 0),
+                    coalesce(sum(case when upper(coalesce(ed.codigo, '')) in :codigosAvisoCorte then 1 else 0 end), 0),
+                    coalesce(sum(case when upper(coalesce(ed.codigo, '')) in :codigosIntimacion then 1 else 0 end), 0),
+                    coalesce(sum(case when upper(coalesce(ed.codigo, '')) in :codigosCorte then 1 else 0 end), 0),
+                    coalesce(sum(case when e.tipoEvento = :compromisoRegistrado then 1 else 0 end), 0)
+                from CasoEvento e
+                join e.casoSeguimiento c
+                join c.inmueble i
+                left join e.etapaDestino ed
+                where i.esPrueba = false and e.fechaEvento >= :inicio and e.fechaEvento < :fin
+                  and e.tipoEvento in (:inicioProceso, :avanceEtapa, :repeticionEtapa, :compromisoRegistrado)
+                  and (:grupoId is null or i.grupo.id = :grupoId)
+                  and (:distritoId is null or i.distrito.id = :distritoId)
+                """, Object[].class)
+                .setParameter("inicioProceso", CasoEventoTipo.INICIO_PROCESO)
+                .setParameter("avanceEtapa", CasoEventoTipo.AVANCE_ETAPA)
+                .setParameter("repeticionEtapa", CasoEventoTipo.REPETICION_ETAPA)
+                .setParameter("compromisoRegistrado", CasoEventoTipo.COMPROMISO_REGISTRADO)
+                .setParameter("codigosAvisoDeuda", List.of("RECORDATORIO_DE_DEUDA", "AVISO_DE_DEUDA"))
+                .setParameter("codigosAvisoCorte", List.of("AVISO_DE_CORTE"))
+                .setParameter("codigosIntimacion", List.of("INTIMACION"))
+                .setParameter("codigosCorte", List.of("CORTE"))
+                .setParameter("inicio", inicio)
+                .setParameter("fin", fin)
+                .setParameter("grupoId", grupoId)
+                .setParameter("distritoId", distritoId)
+                .getSingleResult();
+
+        long avisosDeuda = numberOrZero(eventos[0]);
+        long avisosCorte = numberOrZero(eventos[1]);
+        long intimaciones = numberOrZero(eventos[2]);
+        long regularizaciones = countCierresPorMotivo("REGULARIZACION", inicio, fin, grupoId, distritoId);
+        long planesPago = countPlanesPago(inicio, fin, grupoId, distritoId);
+        long compromisos = numberOrZero(eventos[4]);
+
+        return new DashboardAccionesMesResponse(
+                avisosDeuda,
+                avisosCorte,
+                intimaciones,
+                numberOrZero(eventos[3]),
+                regularizaciones,
+                planesPago,
+                compromisos);
+    }
+
+    private Map<UUID, DistritosAccionAgg> queryAccionesPorDistrito(Instant inicio, Instant fin, UUID grupoId, UUID distritoId) {
+        List<Object[]> rows = entityManager.createQuery("""
+                select i.distrito.id,
+                       coalesce(sum(case when upper(coalesce(ed.codigo, '')) in :codigosAvisoDeuda then 1 else 0 end), 0),
+                       coalesce(sum(case when upper(coalesce(ed.codigo, '')) in :codigosAvisoCorte then 1 else 0 end), 0),
+                       coalesce(sum(case when upper(coalesce(ed.codigo, '')) in :codigosIntimacion then 1 else 0 end), 0),
+                       coalesce(sum(case when upper(coalesce(ed.codigo, '')) in :codigosCorte then 1 else 0 end), 0)
+                from CasoEvento e
+                join e.casoSeguimiento c
+                join c.inmueble i
+                left join e.etapaDestino ed
+                where i.esPrueba = false and e.fechaEvento >= :inicio and e.fechaEvento < :fin
+                  and e.tipoEvento in (:inicioProceso, :avanceEtapa, :repeticionEtapa)
+                  and (:grupoId is null or i.grupo.id = :grupoId)
+                  and (:distritoId is null or i.distrito.id = :distritoId)
+                group by i.distrito.id
+                """, Object[].class)
+                .setParameter("inicioProceso", CasoEventoTipo.INICIO_PROCESO)
+                .setParameter("avanceEtapa", CasoEventoTipo.AVANCE_ETAPA)
+                .setParameter("repeticionEtapa", CasoEventoTipo.REPETICION_ETAPA)
+                .setParameter("codigosAvisoDeuda", List.of("RECORDATORIO_DE_DEUDA", "AVISO_DE_DEUDA"))
+                .setParameter("codigosAvisoCorte", List.of("AVISO_DE_CORTE"))
+                .setParameter("codigosIntimacion", List.of("INTIMACION"))
+                .setParameter("codigosCorte", List.of("CORTE"))
+                .setParameter("inicio", inicio)
+                .setParameter("fin", fin)
+                .setParameter("grupoId", grupoId)
+                .setParameter("distritoId", distritoId)
+                .getResultList();
+
+        return rows.stream().collect(Collectors.toMap(
+                r -> (UUID) r[0],
+                r -> new DistritosAccionAgg(numberOrZero(r[1]), numberOrZero(r[2]), numberOrZero(r[3]), numberOrZero(r[4]))
+        ));
+    }
+
+    private List<DashboardMovimientoResponse> queryMovimientos(Instant inicio, Instant fin, UUID grupoId, UUID distritoId) {
+        TypedQuery<Object[]> q = entityManager.createQuery("""
+                select e.fechaEvento, e.tipoEvento, i.cuenta, i.titular, coalesce(ed.nombre, eo.nombre), e.createdBy
+                from CasoEvento e
+                join e.casoSeguimiento c
+                join c.inmueble i
+                left join e.etapaDestino ed
+                left join e.etapaOrigen eo
+                where i.esPrueba = false and (:grupoId is null or i.grupo.id = :grupoId)
+                  and (:distritoId is null or i.distrito.id = :distritoId)
+                  and e.fechaEvento >= :inicio and e.fechaEvento < :fin
+                order by e.fechaEvento desc
+                """, Object[].class);
+        q.setParameter("grupoId", grupoId);
+        q.setParameter("distritoId", distritoId);
+        q.setParameter("inicio", inicio);
+        q.setParameter("fin", fin);
+        q.setMaxResults(20);
+        return q.getResultList().stream().map(r -> new DashboardMovimientoResponse(
+                ((Instant) r[0]).atOffset(ZoneOffset.UTC),
+                ((Enum<?>) r[1]).name(),
+                (String) r[2],
+                (String) r[3],
+                (String) r[4],
+                (UUID) r[5],
+                "SEGUIMIENTO")).toList();
+    }
+
+    private long countCierresPorMotivo(String motivoCodigo, Instant inicio, Instant fin, UUID grupoId, UUID distritoId) {
+        return entityManager.createQuery("""
+                select count(p.id)
+                from ProcesoCierre p
+                join p.casoSeguimiento c
+                join c.inmueble i
+                join p.motivoCierre m
+                where i.esPrueba = false and p.fechaCierre >= :inicio and p.fechaCierre < :fin
+                  and upper(m.codigo) = upper(:motivoCodigo)
+                  and (:grupoId is null or i.grupo.id = :grupoId)
+                  and (:distritoId is null or i.distrito.id = :distritoId)
+                """, Long.class)
+                .setParameter("motivoCodigo", motivoCodigo)
+                .setParameter("inicio", inicio)
+                .setParameter("fin", fin)
+                .setParameter("grupoId", grupoId)
+                .setParameter("distritoId", distritoId)
+                .getSingleResult();
+    }
+
+    private long countPlanesPago(Instant inicio, Instant fin, UUID grupoId, UUID distritoId) {
+        return entityManager.createQuery("""
+                select count(pp.id)
+                from ProcesoCierrePlanPago pp
+                join pp.procesoCierre p
+                join p.casoSeguimiento c
+                join c.inmueble i
+                where i.esPrueba = false and p.fechaCierre >= :inicio and p.fechaCierre < :fin
+                  and (:grupoId is null or i.grupo.id = :grupoId)
+                  and (:distritoId is null or i.distrito.id = :distritoId)
+                """, Long.class)
+                .setParameter("inicio", inicio)
+                .setParameter("fin", fin)
+                .setParameter("grupoId", grupoId)
+                .setParameter("distritoId", distritoId)
+                .getSingleResult();
+    }
+
+
+    private Instant inicioRango(LocalDate desde) {
+        LocalDate base = desde == null ? LocalDate.now(ZoneOffset.UTC).with(TemporalAdjusters.firstDayOfMonth()) : desde;
+        return base.atStartOfDay().toInstant(ZoneOffset.UTC);
+    }
+
+    private Instant finRango(LocalDate hasta) {
+        LocalDate base = hasta == null ? LocalDate.now(ZoneOffset.UTC).plusMonths(1).with(TemporalAdjusters.firstDayOfMonth()) : hasta.plusDays(1);
+        return base.atStartOfDay().toInstant(ZoneOffset.UTC);
+    }
+
+    private long numberOrZero(Object n) {
+        return n == null ? 0L : ((Number) n).longValue();
+    }
+
+    private BigDecimal decimalOrZero(Object n) {
+        return n == null ? BigDecimal.ZERO : (BigDecimal) n;
+    }
+
+    private record DistritosAccionAgg(long avisosDeuda, long avisosCorte, long intimaciones, long cortes) {
+        private static final DistritosAccionAgg ZERO = new DistritosAccionAgg(0, 0, 0, 0);
+    }
+}

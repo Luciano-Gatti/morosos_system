@@ -1,0 +1,93 @@
+import { normalizePageResponse, normalizeSpringPage } from "@/adapters/pagination";
+import { apiClient, buildQueryParams, type QueryValue } from "@/lib/apiClient";
+import type { FrontendPage, PageResponse, SpringPage } from "@/types/pagination";
+
+export interface InmuebleDto {
+  id: string;
+  cuenta: string;
+  titular: string;
+  direccion: string;
+  grupo: string;
+  distrito: string;
+  activo: boolean;
+  esPrueba?: boolean;
+  beneficioCuenta?: string;
+  observacion?: string;
+  telefono?: string;
+  email?: string;
+  observaciones?: string;
+  seguimientoHabilitado?: boolean;
+  grupoId?: string;
+  grupoCodigo?: string;
+  grupoNombre?: string;
+  distritoId?: string;
+  distritoCodigo?: string;
+  distritoNombre?: string;
+}
+
+export interface HistorialDeudaItem {
+  fechaCarga: string;
+  periodo: string;
+  cuotasAdeudadas: number;
+  montoAdeudado: number;
+  estado?: string;
+  origen?: string;
+}
+export interface HistorialDeudaResponse {
+  inmueble: { id: string; cuenta: string; titular: string };
+  resumen: { deudaActual: number; cuotasActuales: number; mayorDeuda: number; ultimaActualizacion?: string | null };
+  items: HistorialDeudaItem[];
+}
+
+export interface ObservacionExpedienteItem { id: string; fecha: string; responsable: string; texto: string; }
+export interface EtapaObservaciones { etapaId: string; etapaNombre: string; observaciones: ObservacionExpedienteItem[]; }
+export interface ProcesoObservaciones {
+  procesoId: string;
+  estado: string;
+  fechaInicio?: string | null;
+  fechaCierre?: string | null;
+  etapaActualId?: string | null;
+  etapas: EtapaObservaciones[];
+}
+export interface ObservacionesExpedienteResponse {
+  inmueble: { id: string; cuenta: string; titular: string };
+  totalObservaciones: number;
+  procesos: ProcesoObservaciones[];
+}
+
+export interface ImportacionInmuebleDto {
+  id: string;
+  totalRegistros?: number;
+  procesados?: number;
+  creados?: number;
+  actualizados?: number;
+  sinCambios?: number;
+  errores?: number;
+  estado?: string;
+}
+
+export type ErrorImportacionInmuebleDto = Record<string, unknown>;
+type InmueblesQueryParams = Record<string, QueryValue>;
+
+export const inmueblesApi = {
+  async list(params: InmueblesQueryParams): Promise<FrontendPage<InmuebleDto>> {
+    const data = await apiClient.get<PageResponse<InmuebleDto> | SpringPage<InmuebleDto>>(`/api/v1/inmuebles${buildQueryParams(params)}`);
+    return "number" in data ? normalizeSpringPage(data) : normalizePageResponse(data);
+  },
+  getById: (id: string) => apiClient.get<InmuebleDto>(`/api/v1/inmuebles/${id}`),
+  update: (id: string, body: Partial<InmuebleDto>) => apiClient.put<InmuebleDto>(`/api/v1/inmuebles/${id}`, body),
+  toggleActivo: (id: string, activo: boolean) => apiClient.patch(`/api/v1/inmuebles/${id}/activo`, { activo }),
+  toggleSeguimiento: (id: string, seguimientoHabilitado: boolean) => apiClient.patch(`/api/v1/inmuebles/${id}/seguimiento-habilitado`, { seguimientoHabilitado }),
+  importarInmuebles: (file: File) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    return apiClient.post<ImportacionInmuebleDto>(`/api/v1/inmuebles/importaciones`, formData);
+  },
+  getImportacionInmueble: (id: string) => apiClient.get<ImportacionInmuebleDto>(`/api/v1/inmuebles/importaciones/${id}`),
+  getHistorialDeuda: (id: string, params: InmueblesQueryParams) => apiClient.get<HistorialDeudaResponse>(`/api/v1/inmuebles/${id}/historial-deuda${buildQueryParams(params)}`),
+  getObservacionesExpediente: (id: string, params: InmueblesQueryParams) => apiClient.get<ObservacionesExpedienteResponse>(`/api/v1/inmuebles/${id}/observaciones-expediente${buildQueryParams(params)}`),
+  async getErroresImportacionInmueble(id: string, params: InmueblesQueryParams): Promise<FrontendPage<ErrorImportacionInmuebleDto>> {
+    const data = await apiClient.get<PageResponse<ErrorImportacionInmuebleDto> | SpringPage<ErrorImportacionInmuebleDto>>(`/api/v1/inmuebles/importaciones/${id}/errores${buildQueryParams(params)}`);
+    return "number" in data ? normalizeSpringPage(data) : normalizePageResponse(data);
+  },
+};
