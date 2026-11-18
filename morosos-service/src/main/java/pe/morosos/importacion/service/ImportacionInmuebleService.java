@@ -190,7 +190,10 @@ public class ImportacionInmuebleService {
     static String direccionPadron(Map<String,String> row) {
         String direccion = row.get("direccion");
         if (!row.containsKey("calle") || !row.get("calle").equals(direccion)) return direccion;
-        StringBuilder completa = new StringBuilder(direccion);
+        StringBuilder completa = new StringBuilder();
+        String barrio = trimToNull(row.get("barrio"));
+        if (barrio != null && !barrio.equals("-")) completa.append("Barrio: ").append(barrio).append(" - ");
+        completa.append(direccion);
         agregarParte(completa, "", row.get("altura"));
         agregarParte(completa, " Mza.", row.get("manzana"));
         agregarParte(completa, " Piso", row.get("piso"));
